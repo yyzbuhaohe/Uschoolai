@@ -1,0 +1,34 @@
+node_modules/
+__pycache__/
+*.pyc
+
+# 开发期文件：调试脚本 / 参考实现 / 备份 / 日志
+.dev/
+logs/
+*.log
+*.bak-*
+*.crx
+
+# 运行期状态（含 API Key，绝不入库）
+control.json
+state.json
+control.json.bak-*
+
+# 媒体临时文件
+*.wav
+*.b64
+*.mp3
+
+# 截图（文档配图除外）
+*.png
+!docs/ui.png
+!assets/*.png
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 调试输出
+*.out
+*.err
+tts-script.txt
