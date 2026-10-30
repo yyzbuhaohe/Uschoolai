@@ -15,6 +15,20 @@
 | 排序 | `sequence-reply-view-item` | 转写取时间轴 → 模型找证据句 → 按证据句时间拖拽 | **100** |
 | **改错** | `.question-revise-mistake` + 逐词 `.mistake-atom` | 转写 → 模型指出错词 → 点词 → change → 填词 → 提交 | 见下 |
 
+## 跟读题（Vocabulary / read aloud）
+
+**一个页面只肯要一次麦克风。** 录完第一句之后，再点别的句子的麦克风，页面**根本不会调 `getUserMedia`**（实测 0 次调用，也没有任何提示），所以一屏 6 句只能拿到 1 句的分——这就是"跟读只对一道"的真正原因。
+
+修法：**每句录之前刷一次页面**（`reloadForVoice()`）。刷新后录音组件重新挂载，下一句立刻能录。已录的分在服务端，刷新不丢。
+
+其它要点：
+
+- 点麦克风用**坐标点击**（`.record-icon.button-record` 的 rect），`el.click()` 在这个 SPA 里不可靠
+- 点之前 `scrollIntoView({block:'center'})`，否则按钮在视口外根本点不到
+- 录之前先看 `window.__voiceProbe.n` 有没有 +1 —— 页面没要麦克风就是没开始录，别傻等
+- 停止按钮的位置会因为计分面板出现而变，停之前重新量一次 rect
+- 成句分数 89~97，平均 94 左右
+
 ## 改错题（revise mistake）
 
 页面把每句拆成一个个单词的 span，**点词才出操作菜单**，不是让你整句重写：

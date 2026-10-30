@@ -336,6 +336,15 @@ function solveBlank(stmt, passage) {
     }
   }
 
+  // 跟读屏的录音组件一个页面只肯要一次麦克风：录完一句之后，别的句子点麦克风根本不会调
+  // getUserMedia（实测第 2 句起 0 次调用；刷新页面立刻恢复）。所以每句之前刷一次页面。
+  async function reloadForVoice() {
+    await c.call('Page.reload', { ignoreCache: false });
+    await sleep(6000);
+    await closeDlg();
+    await sleep(800);
+  }
+
   async function reloadAndWait() {
     log('    刷新页面重试…');
     await c.call('Page.reload', { ignoreCache: false });
@@ -622,23 +631,108 @@ function solveBlank(stmt, passage) {
     await sleep(600);
     log('    主观题 ' + n + ' 个，填固定文案');
   }
+  // 假麦克风：每次 gUM 都新建 MediaStreamDestination，并把这次的真实情况记下来
+  // （只看"点没点上"不够，得知道页面到底有没有真的来要麦克风）
+  const VOICE_PATCH = '(function(){' +
+    'if(window.__voicePatched)return "ok";window.__voicePatched=true;' +
+    'window.__voiceProbe={n:0,started:0,dur:0,last:""};' +
+    'var md=navigator.mediaDevices,orig=md.getUserMedia?md.getUserMedia.bind(md):null;' +
+    'md.getUserMedia=async function(c){' +
+      'if(!c||!c.audio)return orig?orig(c):Promise.reject(new Error("no"));' +
+      'var Ctx=window.AudioContext||window.webkitAudioContext;' +
+      'if(!window.__vctx)window.__vctx=new Ctx();' +
+      'var ctx=window.__vctx;var dst=ctx.createMediaStreamDestination();' +
+      'try{' +
+        'var url=window.__voiceSrc;if(!url){window.__voiceProbe.last="no-src";return dst.stream}' +
+        'var r=await fetch(url);var ab=await r.arrayBuffer();' +
+        'var audio=await ctx.decodeAudioData(ab);' +
+        'window.__voiceProbe.n++;window.__voiceProbe.dur=audio.duration;' +
+        'var src=ctx.createBufferSource();src.buffer=audio;src.connect(dst);' +
+        'setTimeout(function(){try{src.start(0);window.__voiceProbe.started++;window.__voiceProbe.last="started "+audio.duration.toFixed(2)}catch(e){window.__voiceProbe.last="start-err "+e.message}},900)' +
+      '}catch(e){window.__voiceProbe.last="err "+e.message}' +
+      'return dst.stream};return "ok"' +
+  '})()';
+
   async function doVoice() {
     const n = (await kind()).sent;
     if (!n) return;
-    log('    跟读 ' + n + ' 题');
-    await ev("(function(){if(window.__voicePatched)return 'ok';window.__voicePatched=true;window.__voiceDelay=900;var md=navigator.mediaDevices;var orig=md.getUserMedia?md.getUserMedia.bind(md):null;md.getUserMedia=async function(c){if(!c||!c.audio)return orig?orig(c):Promise.reject(new Error('no'));var Ctx=window.AudioContext||window.webkitAudioContext;if(!window.__vctx)window.__vctx=new Ctx();var ctx=window.__vctx;var dst=ctx.createMediaStreamDestination();try{var url=window.__voiceSrc;if(!url)return dst.stream;var r=await fetch(url);var ab=await r.arrayBuffer();var audio=await ctx.decodeAudioData(ab);window.__voiceDur=audio.duration;var src=ctx.createBufferSource();src.buffer=audio;src.connect(dst);setTimeout(function(){try{src.start(0)}catch(e){}},900)}catch(e){}return dst.stream};return 'ok'})()");
+    log('    跟读 ' + n + ' 题（每句前刷一次页面：这屏的录音组件只肯要一次麦克风）');
+
+    const micRect = i => '(function(){' +
+      'var s=document.querySelectorAll(".sentence-container")[' + i + '];' +
+      'if(!s)return JSON.stringify({err:"no-row"});' +
+      's.scrollIntoView({block:"center"});' +
+      'var b=s.querySelector(".record-icon.button-record");' +
+      'if(!b)return JSON.stringify({err:"no-mic"});' +
+      'var r=b.getBoundingClientRect();' +
+      'return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)});' +
+    '})()';
+
+    // 录一句：返回 true 表示这次真的录了并且出了分
+    const recordOne = async (i) => {
+      await ev(VOICE_PATCH);
+
+      const setSrc = await ev('(function(){var s=document.querySelectorAll(".sentence-container")[' + i + '];' +
+        'if(!s)return "none";var a=s.querySelector("audio");if(!a)return "noaudio";' +
+        'window.__voiceSrc=a.currentSrc||a.src;return "ok"})()');
+      if (setSrc !== 'ok') { log('      第' + (i + 1) + '句 没有示范音（' + setSrc + '），跳过'); return false; }
+
+      let rect = JSON.parse(await ev(micRect(i)) || '{}');
+      if (rect.err) { log('      第' + (i + 1) + '句 找不到麦克风按钮（' + rect.err + '）'); return false; }
+
+      const beforeN = await ev('window.__voiceProbe.n');
+      await click(rect.x, rect.y);
+      let started = false;
+      for (let t = 0; t < 16; t++) {
+        await sleep(250);
+        if (Number(await ev('window.__voiceProbe.n')) > Number(beforeN)) { started = true; break; }
+      }
+      if (!started) {
+        rect = JSON.parse(await ev(micRect(i)) || '{}');
+        await sleep(400);
+        await click(rect.x, rect.y);
+        for (let t = 0; t < 16; t++) {
+          await sleep(250);
+          if (Number(await ev('window.__voiceProbe.n')) > Number(beforeN)) { started = true; break; }
+        }
+      }
+      if (!started) { log('      第' + (i + 1) + '句 点了麦克风没开始录音（页面没要麦克风），跳过'); return false; }
+
+      const dur = Number(await ev('window.__voiceProbe.dur')) || 2.5;
+      await sleep(Math.round((dur + 1.2) * 1000));
+
+      rect = JSON.parse(await ev(micRect(i)) || '{}');
+      if (!rect.x) { log('      第' + (i + 1) + '句 停止时找不到按钮'); return false; }
+      await click(rect.x, rect.y);
+
+      let scored = false;
+      for (let t = 0; t < 20; t++) {
+        await sleep(400);
+        const rowTxt = await ev('(function(){var s=document.querySelectorAll(".sentence-container")[' + i + '];' +
+          'return s?String(s.textContent||"").replace(/\\s+/g," ").slice(0,60):""})()');
+        if (/准确度|流利度|完整度/.test(rowTxt) || /^\s*\d{1,3}/.test(String(rowTxt))) { scored = true; break; }
+      }
+      log('      第' + (i + 1) + '句 ' + dur.toFixed(1) + 's ' + (scored ? '已评分' : '录了但没出分'));
+      await sleep(400);
+      return scored;
+    };
+
+    let ok = 0;
+    const failed = [];
     for (let i = 0; i < n; i++) {
-      const src = await ev("(function(){var s=document.querySelectorAll('.sentence-container')[" + i + "];if(!s)return 'none';var a=s.querySelector('audio');if(!a)return 'noaudio';window.__voiceSrc=a.currentSrc||a.src;return 'ok'})()");
-      if (src !== 'ok') continue;
-      const clk = "(function(){var s=document.querySelectorAll('.sentence-container')[" + i + "];var b=s.querySelector('.record-icon.button-record');if(!b)return 'none';b.click();return 'ok'})()";
-      await ev(clk);
-      await sleep(1600);
-      const dur = await ev('window.__voiceDur || 2.5');
-      await sleep(Math.round(((dur || 2.5) + 1) * 1000));
-      await ev(clk);
-      await sleep(2200);
+      // 第一句用当前页面，之后每句刷一次（见 reloadForVoice 的注释）
+      if (i > 0) await reloadForVoice();
+      if (await recordOne(i)) ok++; else failed.push(i);
     }
-    log('    跟读完成');
+    // 没成的再刷一遍重试一次（有的行第一轮录不上，第二轮能上）
+    if (failed.length) {
+      log('    重试 ' + failed.length + ' 句：' + failed.map(i => i + 1).join(','));
+      for (const i of failed.slice()) {
+        await reloadForVoice();
+        if (await recordOne(i)) { ok++; failed.splice(failed.indexOf(i), 1); }
+      }
+    }
+    log('    跟读完成 ' + ok + '/' + n + ' 句有分' + (failed.length ? '（没分：第 ' + failed.map(i => i + 1).join(',') + ' 句）' : ''));
   }
 
   // ---- 改错题（.question-revise-mistake）----

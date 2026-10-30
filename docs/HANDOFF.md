@@ -431,7 +431,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .dev\make-pack.ps1 -Zip    #
 - `POTATO_NO_SUBMIT=1`：填完不提交。改错/口语题只记第一次作答，调题型必须带这个
 - `POTATO_CORRECT_PLAN='[{"i":1,"op":"change","from":"difficult","to":"hard"}]'`：跳过模型，按给定改法执行，用来验填充链路（没 Key 也能测）
 
-### 11.9 默认值
+### 11.9 跟读题"只对一道"的根因（v1.1.4）
+
+**现象**：一屏 6 句跟读，只有 1 句有分（16 分 ≈ 1/6）。老 `doVoice()` 用 `el.click()` 连点 6 个麦克风，日志只有"跟读完成"，没有任何单句信息。
+
+**根因**：这个录音组件**一个页面只肯要一次麦克风**。第一句录完后，其它句子点麦克风时页面**完全不调 `getUserMedia`**（不是被拒，是压根没调用），也没有 toast / disabled 样式。刷新页面立刻恢复。
+
+**现在的做法**：
+
+1. 每句之前 `reloadForVoice()`（Page.reload + 等 6s + closeDlg）
+2. 刷新后重新装 `VOICE_PATCH`（页面上下文换了，标志位没了）
+3. `scrollIntoView` → 量 `.record-icon.button-record` 的 rect → **坐标点击**
+4. 轮询 `window.__voiceProbe.n` 确认页面真的来要了麦克风（没有就重试一次）
+5. 等 `dur + 1.2s` → 重新量 rect 点停止 → 轮询这一行是否出分
+6. 失败的行最后统一再刷一轮重试一次
+
+实测：同一屏从 **1/6 → 6/6**（96 / 96 / 89 / 97 / 95 / 94）。代价是每句多 6 秒刷新时间，一屏 6 句约 75 秒。
+
+**注意**：页面只记第一次作答的分，这屏之前已经记成 16 分就补不回来了；改的是往后的屏。
+
+### 11.10 默认值
 
 `control.json` / `serve.py` / `run-all.js` / 面板里的主观题兜底文案，从 `关注塔菲谢谢喵！` 改成 `I think this unit is interesting and useful.` —— 之前新用户模型调用失败时，会把中文口号当答案交进英语讨论区。
 
