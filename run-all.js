@@ -108,6 +108,8 @@ async function preflight() {
   const maxSec = Number(process.argv[2] || 3);
   // --here：只跑当前这一屏，不遍历整节的 tab/task（调试和快速验证用）
   const HERE_ONLY = process.argv.includes('--here');
+  // POTATO_NO_SUBMIT=1：填完不提交，调试题型时用（改错题/口语题只记第一次作答，误提交就补不回来）
+  const NO_SUBMIT = process.env.POTATO_NO_SUBMIT === '1';
   const _c0 = readCtrl();   // 统一走带 BOM 兼容的读取
   const FILLER_TEXT = _c0.fillerText || 'I think this unit is interesting and useful.';
   const COMMENT_TEXT = _c0.commentText || 'I think this unit is interesting and useful.';
@@ -203,7 +205,7 @@ function solveBlank(stmt, passage) {
   const type = t => c.call('Input.insertText', { text: t });
   const btn = async ws => { const v = await ev("(function(){var ws=" + JSON.stringify(ws) + ";var h=null;document.querySelectorAll('a,button,.ant-btn,div[role=button]').forEach(function(b){if(b.offsetParent===null)return;var t=String(b.textContent||'').replace(/\\s+/g,'');if(ws.indexOf(t)<0)return;var r=b.getBoundingClientRect();if(r.width<4)return;h={el:b,t:t}});if(h&&h.el){h.el.scrollIntoView({block:'center'});var rr=h.el.getBoundingClientRect();h={x:Math.round(rr.left+rr.width/2),y:Math.round(rr.top+rr.height/2),t:h.t}}return JSON.stringify(h)})()"); return v && v !== 'null' ? JSON.parse(v) : null; };
   const closeDlg = async () => { const d = await btn(['我知道了']); if (d) { await click(d.x, d.y); await sleep(800); return true; } return false; };
-  const kind = async () => JSON.parse(await ev("JSON.stringify({ins:document.querySelectorAll('.scoop-input-wrapper input').length,opt:document.querySelectorAll('.option').length,ta:[].slice.call(document.querySelectorAll('textarea')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>60&&r.height>20}).length,dd:[].slice.call(document.querySelectorAll('.ant-dropdown-trigger.user-answer')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();if(r.width<10||r.height<4)return false;if(r.top<0||r.bottom>window.innerHeight)return false;var box=e.closest('.question-common-abs-reply,.question,.answers-list,.layoutBody-container');if(!box)return false;var br=box.getBoundingClientRect();return br.width>50&&br.height>20}).length,qa:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;if(/评论/.test(t.placeholder||''))return false;if(t.closest('[class*=discussion]'))return false;var r=t.getBoundingClientRect();return r.width>60&&r.height>20}).length,cmt:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;var r=t.getBoundingClientRect();if(r.width<60||r.height<20)return false;return /评论/.test(t.placeholder||'')||!!t.closest('[class*=discussion]')}).length,up:(document.querySelector('.question-multi-file-upload')?1:0),sort:document.querySelectorAll('[class*=sequence-reply-view-item]').length,img:[].slice.call(document.querySelectorAll('.option img,.option-placeholder img')).filter(function(e){var o=e.closest('.option,.option-placeholder');if(!o||o.offsetParent===null)return false;var r=o.getBoundingClientRect();return r.width>4&&r.height>4}).length,sent:document.querySelectorAll('.sentence-container').length,rec:document.querySelectorAll('.record-icon.button-record').length})") || '{}');
+  const kind = async () => JSON.parse(await ev("JSON.stringify({ins:document.querySelectorAll('.scoop-input-wrapper input').length,opt:document.querySelectorAll('.option').length,ta:[].slice.call(document.querySelectorAll('textarea')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>60&&r.height>20}).length,dd:[].slice.call(document.querySelectorAll('.ant-dropdown-trigger.user-answer')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();if(r.width<10||r.height<4)return false;if(r.top<0||r.bottom>window.innerHeight)return false;var box=e.closest('.question-common-abs-reply,.question,.answers-list,.layoutBody-container');if(!box)return false;var br=box.getBoundingClientRect();return br.width>50&&br.height>20}).length,qa:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;if(/评论/.test(t.placeholder||''))return false;if(t.closest('[class*=discussion]'))return false;var r=t.getBoundingClientRect();return r.width>60&&r.height>20}).length,cmt:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;var r=t.getBoundingClientRect();if(r.width<60||r.height<20)return false;return /评论/.test(t.placeholder||'')||!!t.closest('[class*=discussion]')}).length,up:(document.querySelector('.question-multi-file-upload')?1:0),sort:document.querySelectorAll('[class*=sequence-reply-view-item]').length,img:[].slice.call(document.querySelectorAll('.option img,.option-placeholder img')).filter(function(e){var o=e.closest('.option,.option-placeholder');if(!o||o.offsetParent===null)return false;var r=o.getBoundingClientRect();return r.width>4&&r.height>4}).length,sent:document.querySelectorAll('.sentence-container').length,rec:document.querySelectorAll('.record-icon.button-record').length,rev:document.querySelectorAll('.question-revise-mistake').length})") || '{}');
   const waitKind = async (maxMs = 8000) => {
     const t0 = Date.now();
     let last = null;
@@ -639,6 +641,133 @@ function solveBlank(stmt, passage) {
     log('    跟读完成');
   }
 
+  // ---- 改错题（.question-revise-mistake）----
+  // 页面把每句拆成逐个单词 span.mistake-atom；点某个词 → 弹出 .ant-popover，
+  // 里面有 add-before / change / delete / mark-correct 四个动作；
+  // 选 change → .mistake-item-edit-form 里出现 input.edit-form-input + button.edit-form-submit。
+  // 注意：input 必须用真实输入事件（Input.insertText）改，直接赋 value 的话 React 收不到，
+  // 提交按钮点了没反应（我第一次就是这么试的）。
+  const REV_LINES_JS = "(function(){return JSON.stringify([].slice.call(document.querySelectorAll('.comp-revise-mistake-reply')).map(function(e){return String(e.textContent||'').replace(/\\s+/g,' ').trim()}))})()";
+
+  async function revClickWord(idx, word) {
+    const r = JSON.parse(await ev('(function(){' +
+      'var item=document.querySelectorAll(".comp-revise-mistake-reply")[' + idx + '];' +
+      'if(!item)return JSON.stringify({err:"no-item"});' +
+      'var atoms=[].slice.call(item.querySelectorAll(".mistake-atom"));' +
+      'var want=' + JSON.stringify(word) + ';' +
+      'var hit=null;' +
+      'var clean=function(s){return String(s||"").replace(/^[^A-Za-z]+/,"").replace(/[^A-Za-z"]+$/,"");};' +
+      // 四层匹配：原样 → 忽略大小写 → 去标点 → 前缀（词形变化时也能对上）
+      'atoms.forEach(function(a){var t=String(a.textContent||"").trim();if(hit)return;if(t===want)hit=a;});' +
+      'if(!hit)atoms.forEach(function(a){var t=String(a.textContent||"").trim();if(hit)return;if(t.toLowerCase()===want.toLowerCase())hit=a;});' +
+      'if(!hit)atoms.forEach(function(a){var t=clean(a.textContent);if(hit)return;if(t&&t.toLowerCase()===clean(want).toLowerCase())hit=a;});' +
+      'if(!hit)atoms.forEach(function(a){var t=clean(a.textContent).toLowerCase(),w2=clean(want).toLowerCase();if(hit)return;if(t&&w2&&t.length>2&&t.indexOf(w2)===0)hit=a;});' +
+      'if(!hit)return JSON.stringify({err:"no-atom"});' +
+      'hit.scrollIntoView({block:"center"});' +
+      'var b=hit.getBoundingClientRect();' +
+      'return JSON.stringify({x:Math.round(b.left+b.width/2),y:Math.round(b.top+b.height/2)});' +
+    '})()') || '{}');
+    if (!r.x) return r.err || 'no-coord';
+    await click(r.x, r.y);
+    await sleep(850);
+    return 'ok';
+  }
+
+  // 在弹层里点某个动作，返回是否点到了
+  async function revAction(label) {
+    const ok = await ev('(function(){var el=[].slice.call(document.querySelectorAll(".ant-popover .mistake-item-action"))' +
+      '.filter(function(e){return String(e.textContent||"").trim()===' + JSON.stringify(label) + '})[0];' +
+      'if(!el)return 0;el.click();return 1})()');
+    await sleep(700);
+    if (!ok) {
+      // 这个词之前改过：点开的是「确定撤销该操作吗？」，点取消关掉，千万别点确定把答案撤销了
+      await ev('(function(){var bs=[].slice.call(document.querySelectorAll(".ant-popover button"))' +
+        '.filter(function(b){return /取消/.test(String(b.textContent||""))});if(bs.length)bs[0].click();return 1})()');
+      await sleep(300);
+    }
+    return !!ok;
+  }
+
+  async function revSubmitForm(text) {
+    if (text) {
+      await ev('(function(){var i=document.querySelector(".edit-form-input");if(!i)return 0;i.focus();try{i.select()}catch(e){};return 1})()');
+      await type(text);   // Input.insertText：真实输入事件，React 才认得
+      await sleep(350);
+    }
+    const ok = await ev('(function(){var b=document.querySelector(".mistake-item-edit-form button.edit-form-submit");' +
+      'if(!b)return 0;b.click();return 1})()');
+    await sleep(900);
+    return !!ok;
+  }
+
+  async function doCorrect(k) {
+    const lines = JSON.parse(await ev(REV_LINES_JS) || '[]');
+    if (!lines.length) { log('    !! 改错题没读到句子，跳过'); return; }
+    log('    改错题 ' + lines.length + ' 句');
+
+    // 有视频就先转写，给模型当依据
+    let passage = '';
+    const vurl0 = await waitMedia(12000);
+    if (vurl0) {
+      try {
+        const st = await (await fetch(SRV + '/stt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: String(vurl0).split('#')[0] }) })).json();
+        if (st.ok) { passage = String(st.text || ''); log('    已转写 ' + passage.length + ' 字符'); }
+        else log('    !! 转写失败：' + String(st.err || '').slice(0, 80));
+      } catch (e) { log('    !! 转写出错 ' + e.message); }
+    }
+
+    const q = '视频原文（自动转写，可能有个别错词，仅作参考）：\n' + (passage || '(没有)') +
+      '\n\n待改错的句子（每句有一处错）：\n' + lines.map((t, i) => (i + 1) + '. ' + t).join('\n') +
+      '\n\n任务：逐句找出错的那个词，给出改法。要求：' +
+      '\n- op=change：把 from 换成 to（错的是短语时，改短语里最关键的那个词）' +
+      '\n- op=delete：多出来的词，to 留空' +
+      '\n- op=add-before：少了词，在 from 前面插入 to' +
+      '\n- from 必须是原句里原样出现的一个单词（大小写照抄，不带标点）' +
+      '\n只输出 JSON 数组，形如 [{"i":1,"op":"change","from":"difficult","to":"hard"}]，不要任何解释。';
+    let plan = [];
+    // 调试用：POTATO_CORRECT_PLAN='[{"i":1,"op":"change","from":"difficult","to":"hard"}]'
+    // 跳过模型直接按给定改法执行（没 API Key 也能验填充链路）
+    if (process.env.POTATO_CORRECT_PLAN) {
+      try { plan = JSON.parse(process.env.POTATO_CORRECT_PLAN); log('    用 POTATO_CORRECT_PLAN 指定的改法（调试）'); } catch (e) { plan = []; }
+    }
+    const raw = plan.length ? '' : await ask(q, '只输出 JSON 数组。');
+    try {
+      if (plan.length) throw { skip: true };
+      const m = String(raw).match(/\[[\s\S]*\]/);
+      plan = JSON.parse(m ? m[0] : raw);
+    } catch (e) {
+      if (!(e && e.skip)) {
+        log('    !! 模型没给合法 JSON：' + String(raw).replace(/\s+/g, ' ').slice(0, 120));
+        return;
+      }
+    }
+    if (!Array.isArray(plan) || !plan.length) { log('    !! 模型没给出改法'); return; }
+
+    let done = 0;
+    for (const p of plan) {
+      const idx = Number(p.i) - 1;
+      const from = String(p.from || '').trim();
+      const to = String(p.to || '').trim();
+      const op = String(p.op || 'change');
+      if (!(idx >= 0 && idx < lines.length) || !from) continue;
+      const before = lines[idx];
+      const r = await revClickWord(idx, from);
+      if (r !== 'ok') { log('      第' + (idx + 1) + '句 找不到词「' + from + '」（' + r + '）'); await closeDlg(); continue; }
+      const label = op === 'delete' ? 'delete' : (op === 'add-before' ? 'add-before' : 'change');
+      if (!await revAction(label)) { log('      第' + (idx + 1) + '句 弹层里没找到 ' + label); await ev("(function(){var m=document.querySelector('.ant-popover');if(m)m.remove()})()"); continue; }
+      const sent = await revSubmitForm(label === 'delete' ? '' : to);
+      const after = await ev(REV_LINES_JS);
+      const afterLines = JSON.parse(after || '[]');
+      const now = afterLines[idx] || '';
+      const changed = now !== before;
+      if (changed) done++;
+      log('      第' + (idx + 1) + '句 ' + label + ' "' + from + '"' + (to ? ' → "' + to + '"' : '') + ' ' + (changed ? 'OK' : (sent ? '提交了但句子没变' : '提交按钮没点到')));
+      if (changed) lines[idx] = now;
+      await sleep(300);
+    }
+    log('    改错完成 ' + done + '/' + plan.length);
+  }
+
   // 词级时间戳断句 → 模型为每条陈述找「证据句」→ 按证据句时间定序
   async function sortByEvidence(stmts, vurl) {
     if (!vurl) return null;
@@ -970,6 +1099,7 @@ function solveBlank(stmt, passage) {
           else if (k.ta > 0 && !(k.cmt > 0)) await doDiscussion();
           else if (k.sort > 0) await doSort(k);
           else if (k.rec > 0) await doSpeak();
+          else if (k.rev > 0) await doCorrect(k);
           else if ((await ev("(function(){return document.querySelectorAll('video').length})()")) > 0) await doVideo();
           else if (!(k.cmt > 0)) {
             const probe = await ev("(function(){var t=String(document.body.innerText||'').replace(/\\s+/g,' ');var i=t.indexOf('Directions');return JSON.stringify({txt:i>=0?t.slice(i,i+220):t.slice(0,220),ta:document.querySelectorAll('textarea').length,btn:[].slice.call(document.querySelectorAll('a,button,.ant-btn')).filter(function(b){return b.offsetParent!==null&&String(b.textContent||'').trim().length<=6}).map(function(b){return String(b.textContent||'').replace(/\\s+/g,'')}).slice(0,6)})})()");
@@ -985,6 +1115,7 @@ function solveBlank(stmt, passage) {
           }
         } catch (e) { log('    处理异常 ' + e.message); }
         if (skipSubmit) { log('    未拿到依据，本轮不提交'); continue; }
+        if (NO_SUBMIT) { log('    [POTATO_NO_SUBMIT] 已填好，本轮不提交'); continue; }
         await submit();
       }
     }

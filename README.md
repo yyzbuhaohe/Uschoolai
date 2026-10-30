@@ -68,6 +68,7 @@ ucontent.unipus.cn 的课程页面
 | 说话题 | 录音按钮 + 提示 | 生成口稿 → TTS → 回灌 | 90+ |
 | **配音题** | `.question-video-dub-pc` | 接管示范音 → 逐句回灌 | 82~85 |
 | 上传题 | `.question-multi-file-upload` | 塞一个彩蛋 PDF | 完成即得分 |
+| **改错题** | `.question-revise-mistake` | 转写 → 模型指出错词 → 点词 change → 填新词 | 待实测 |
 
 ---
 

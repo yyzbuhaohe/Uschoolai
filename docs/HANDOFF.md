@@ -416,7 +416,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .dev\make-pack.ps1 -Zip    #
 
 **别手改 pack 目录**。v1.0.0 发出去的那个 zip 就是从 pack 打的，里面 `serve.py` 比仓库旧 6KB（没有 `/api/usage`、没有 `/api/update` 的新版逻辑）、`ui.html` 也是老的、`version.json` 都缺 —— 新用户装完功能和文档写的不是同一份东西。v1.1.0 起 pack 由脚本生成，脚本会**先清空目录**再复制，排除 `control.json` / `py.path` / `logs` / `models` / 各种 `*.log`。
 
-### 11.8 默认值
+### 11.8 改错题（v1.1.2 新增）
+
+`question-revise-mistake`：整句不对，页面把句子拆成逐词 `.mistake-atom`，点词 → 弹层四个动作（add-before / change / delete / mark-correct）→ change 出输入框 → 提交。实现见 `run-all.js` 的 `doCorrect()` / `revClickWord()` / `revAction()` / `revSubmitForm()`。
+
+新人最容易踩的三条（写进 TYPES.md 了，改代码前看）：
+
+1. 输入框要用真实输入事件（`Input.insertText`），直接赋 `value` React 收不到 → 点提交没反应
+2. 表单按钮文字是「提 交」（带空格）
+3. 改过的词再点会弹「确定撤销该操作吗？」→ 认到没 `.mistake-item-action` 就点「取消」
+
+两个调试开关（都是环境变量，不影响正常跑）：
+
+- `POTATO_NO_SUBMIT=1`：填完不提交。改错/口语题只记第一次作答，调题型必须带这个
+- `POTATO_CORRECT_PLAN='[{"i":1,"op":"change","from":"difficult","to":"hard"}]'`：跳过模型，按给定改法执行，用来验填充链路（没 Key 也能测）
+
+### 11.9 默认值
 
 `control.json` / `serve.py` / `run-all.js` / 面板里的主观题兜底文案，从 `关注塔菲谢谢喵！` 改成 `I think this unit is interesting and useful.` —— 之前新用户模型调用失败时，会把中文口号当答案交进英语讨论区。
 

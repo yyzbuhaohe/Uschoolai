@@ -12,12 +12,38 @@
 | Vocabulary 跟读 | `.sentence-container` + 每题自带 wav | 示范音回灌 + 900ms 延迟 | **94.1** |
 | Dubbing 配音 | `.item` + 视频音轨切片 | whisper 分段 → 模型映射 → 切片回灌 | **88.5** |
 | 自由说话 | 1 个 record 按钮 + 2 分钟倒计时 | TTS 生成口述稿 → 回灌 → 等倒计时满 | 92（不计分） |
+| 排序 | `sequence-reply-view-item` | 转写取时间轴 → 模型找证据句 → 按证据句时间拖拽 | **100** |
+| **改错** | `.question-revise-mistake` + 逐词 `.mistake-atom` | 转写 → 模型指出错词 → 点词 → change → 填词 → 提交 | 见下 |
 
-## 待攻破
+## 改错题（revise mistake）
 
-| 题型 | 特征 | 卡点 |
-|---|---|---|
-| 排序题 | `.sortable-list-wrapper` + 8 条 `sequence-reply-view-item` | TouchEvent 拖拽被忽略，需要改 DOM 重排或拦提交 |
+页面把每句拆成一个个单词的 span，**点词才出操作菜单**，不是让你整句重写：
+
+```
+.comp-revise-mistake
+└── .comp-revise-mistake-reply        ← 一句一个
+    └── .mistake-item .mistake-atom   ← 一个词一个（word / space / punctuation）
+        └── .mistake-atom-text
+
+点 .mistake-atom → .ant-popover .mistake-item-action
+    add-before | change | delete | mark-correct
+选 change → .mistake-item-edit-form
+    input.edit-form-input  +  button.edit-form-submit（文字是「提 交」）
+```
+
+三个必踩的坑：
+
+1. **输入框必须用真实输入事件**（CDP `Input.insertText`）。直接 `input.value = '...'` React 收不到，点提交没反应，看着像按钮坏了。
+2. `button.edit-form-submit` 文字是「提 交」（中间有空格），用 `replace(/\s+/g,'')` 再比对。
+3. **改过的词再点会弹「确定撤销该操作吗？」**，那里点确定就把答案撤销了。代码里认到没有 `.mistake-item-action` 就点「取消」关掉。
+
+调试两个环境变量：
+
+```powershell
+$env:POTATO_NO_SUBMIT='1'        # 填完不提交（改错/口语只记第一次作答，误提交补不回来）
+$env:POTATO_CORRECT_PLAN='[{"i":1,"op":"change","from":"difficult","to":"hard"}]'   # 跳过模型直接按给定改法跑
+node run-all.js 1 --here
+```
 
 ## 翻页：只用「继续学习」
 

@@ -1,5 +1,5 @@
 {
-  "build": 2026103002,
-  "name": "v1.1.1",
-  "note": "修：serve.py 找不到 node 时点开始报 WinError 2（现在按 node.path/安装目录/PATH 依次找）"
+  "build": 2026103003,
+  "name": "v1.1.2",
+  "note": "新增改错题（question-revise-mistake）自动作答；POTATO_NO_SUBMIT/POTATO_CORRECT_PLAN 调试开关"
 }
