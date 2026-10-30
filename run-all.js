@@ -416,24 +416,68 @@ function solveBlank(stmt, passage) {
         "if(!window.__dubCtx)window.__dubCtx=new Ctx();" +
         "var ctx=window.__dubCtx;var dst=ctx.createMediaStreamDestination();" +
         "try{" +
+          "try{if(ctx.state==='suspended')await ctx.resume()}catch(e){}" +
           "if(!window.__dubBuf){var r=await fetch(window.__dubUrl);var ab=await r.arrayBuffer();window.__dubBuf=await ctx.decodeAudioData(ab);window.__dubLog.push('dec '+window.__dubBuf.duration.toFixed(1));}" +
           "var src=ctx.createBufferSource();src.buffer=window.__dubBuf;src.connect(dst);" +
-          "setTimeout(function(){try{src.start(0)}catch(e){}},700);" +
+          // 先播 150ms 再让页面开始采：太早会丢开头，太晚页面已经"录音启动超时"
+          "setTimeout(function(){try{src.start(0);window.__dubLog.push('play '+ctx.state)}catch(e){window.__dubLog.push('start-err '+e.message)}},150);" +
         "}catch(e){window.__dubLog.push('fail '+e.message)}" +
         "return dst.stream;" +
       "};return 'ok'" +
     "})()");
-    const btn = await ev("(function(){var b=document.querySelector('.record-icon.button-record');if(!b)return 'null';var r=b.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()");
-    if (btn === 'null') { log('    没有录音按钮'); return; }
-    const bpos = JSON.parse(btn);
-    await ev("(function(){var b=document.querySelector('.record-icon.button-record');if(b)b.click()})()");
-    await sleep(2500);
-    const dur = await ev('(window.__dubBuf&&window.__dubBuf.duration)||45');
+    // 录音按钮必须用坐标点击：这个 SPA 里 el.click() 经常点不动（跟读题就是这么踩过来的），
+    // 之前这里就是 b.click()，而且点完不验证 —— 页面根本没来要麦克风，就一路 sleep 到"说话完成"，
+    // 用户看到的就是"说话题一直放不出声音"。
+    // 说话题的录音按钮未必长成跟读那种 .record-icon.button-record，按优先级多试几种
+    const MIC_SEL = '.record-icon.button-record,.record-button-wrap .record-icon,[class*=record-button] [class*=record],.ucomp-recorder [class*=record]';
+    const micBox = async () => JSON.parse(await ev('(function(){' +
+      'var cands=[].slice.call(document.querySelectorAll(' + JSON.stringify(MIC_SEL) + '))' +
+        '.filter(function(e){var r=e.getBoundingClientRect();return r.width>4&&r.height>4&&e.offsetParent!==null});' +
+      'if(!cands.length){' +
+        'var btns=[].slice.call(document.querySelectorAll("button,a,div[role=button]"))' +
+          '.filter(function(e){return /录音|开始录音|record/i.test(String(e.textContent||""))&&e.offsetParent!==null});' +
+        'cands=btns;' +
+      '}' +
+      'if(!cands.length)return JSON.stringify({err:"no-btn"});' +
+      'var b=cands[0];' +
+      'b.scrollIntoView({block:"center"});' +
+      'var r=b.getBoundingClientRect();' +
+      'return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),cls:String(b.className).slice(0,40)})' +
+    '})()') || '{}');
+
+    let box = await micBox();
+    if (box.err) { log('    没有录音按钮（' + box.err + '），跳过'); return; }
+
+    let started = false, dubLog = '[]';
+    for (let attempt = 0; attempt < 3 && !started; attempt++) {
+      box = await micBox();
+      if (box.err) break;
+      await click(box.x, box.y);
+      for (let t = 0; t < 24; t++) {
+        await sleep(250);
+        const st = await ev('JSON.stringify({log:window.__dubLog||[],counting:!!document.querySelector("[class*=count-down],[class*=countdown]")})');
+        const o = JSON.parse(st || '{}');
+        if ((o.log && o.log.length) || o.counting) { started = true; dubLog = JSON.stringify(o.log || []); break; }
+      }
+      if (!started) log('    （第' + (attempt + 1) + '次点麦克风没反应，重试）');
+    }
+    if (!started) { log('    !! 点了麦克风，页面一直没要麦克风（录音没启动），这题跳过'); return; }
+    log('    录音已启动 ' + dubLog);
+    if (dubLog.indexOf('fail') >= 0) { log('    !! 假麦克风喂音频失败：' + dubLog); return; }
+
+    const dur = Number(await ev('(window.__dubCtx&&window.__dubBuf)?window.__dubBuf.duration:0')) || 45;
     log('    录音 ' + Math.round(dur) + 's');
     await sleep(Math.round((dur + 2) * 1000));
-    await ev("(function(){var b=document.querySelector('.record-icon.button-record');if(b)b.click()})()");
+
+    // 停：按钮位置可能变，重新量
+    box = await micBox();
+    if (!box.err) await click(box.x, box.y); else await ev('(function(){var b=document.querySelector(".record-icon.button-record");if(b)b.click()})()');
     await sleep(4000);
-    log('    说话完成');
+
+    // 收尾看这屏有没有出"已作答/分数"，没有就记一笔，别假装成功
+    const after = await ev('(function(){var t=String(document.body.innerText||"").replace(/\s+/g," ");' +
+      'var m=t.match(/已作答\s*\d+\s*\/\s*\d+|(\d+(\.\d+)?)\s*分/);return m?m[0]:""})()');
+    log('    说话完成' + (after ? '（' + after + '）' : '（没看到分数，可能没被采到）'));
   };
   async function doChoice(k) {
     const qs = JSON.parse(await ev("(function(){" +

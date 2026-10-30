@@ -473,7 +473,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .dev\make-pack.ps1 -Zip    #
 
 实测：同一屏现在判成 `{"ins":4,...,"sent":0}` → `非听力填空（翻译等），直接让模型作答 4 空`，答案正确、不重复。
 
-### 11.11 默认值
+### 11.11 说话题"一直放不出声音"（v1.1.7）
+
+**现象**：说话题日志有"口稿 N 词 / TTS 一串字节 / 录音 45s / 说话完成"，但页面没分、也没声音。
+
+**根因**：`doSpeak()` 原来是这样点录音的：
+
+```js
+await ev("...var b=document.querySelector('.record-icon.button-record');if(b)b.click()");
+await sleep(2500);                       // 点完不验证
+await sleep((dur + 2) * 1000);           // 一路 sleep
+await ev("...b.click()");                // 再点一次"停"
+log('说话完成');                          // 不管成没成，都打"完成"
+```
+
+问题三条：
+
+1. `el.click()` 在这个 SPA 里经常点不动（跟读/改错都是同一课），页面**根本没调 `getUserMedia`**，假麦克风永远拿不到播放机会 → 用户看到的就是"放不出声音"。
+2. 点完不验证，一路 sleep 到底，最后还打"说话完成"，日志看不出失败。
+3. 按钮选择器只认 `.record-icon.button-record`；说话题的按钮如果是别的 class，直接 `return`（日志只有一行"没有录音按钮"）。
+
+**现在的做法**：坐标点击（`scrollIntoView` + rect）+ 多选择器兜底（`.record-icon.button-record` / `.record-button-wrap .record-icon` / `[class*=record-button]`，再不行找文字含"录音"的按钮）+ 最多 3 次重试；点完轮询 `window.__dubLog` 或倒计时元素确认**页面真的来要麦克风**；`__dubLog` 里有 `fail` 就直接报出来；钩子里加 `ctx.resume()` 和 150ms 起播；结束后抓"已作答 N/N"或分数，抓不到就写"可能没被采到"。
+
+**注意**：这一段还没在真实说话题屏上验证过（Speaking out 所在章节当时是锁的）。下次跑到说话题，日志会明确说出卡在哪一步：`没有录音按钮` / `点了麦克风没反应` / `假麦克风喂音频失败` / `没看到分数`。
+
+### 11.12 默认值
 
 `control.json` / `serve.py` / `run-all.js` / 面板里的主观题兜底文案，从 `关注塔菲谢谢喵！` 改成 `I think this unit is interesting and useful.` —— 之前新用户模型调用失败时，会把中文口号当答案交进英语讨论区。
 
