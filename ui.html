@@ -86,6 +86,11 @@
       <label>本地服务 (8787) <span id="chkSrv" class="dim">–</span></label>
       <label>Whisper 模型 <span id="chkStt" class="dim">–</span></label>
       <label>当前页面 <span id="chkPage" class="dim" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">–</span></label>
+      <label>模型用量 <span id="chkUsage" class="dim">–</span></label>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button id="btnUpdate" class="ghost" style="flex:1">检查更新</button>
+        <button id="btnUsageReset" class="ghost" style="flex:1">清零用量</button>
+      </div>
     </div>
 
     <div class="card full">
@@ -100,11 +105,37 @@ const $ = s => document.querySelector(s);
 const API = '';
 
 async function jget(p){ try{ const r = await fetch(API+p,{cache:'no-store'}); return await r.json(); }catch(e){ return null; } }
+document.addEventListener('DOMContentLoaded', () => {
+  const bu = document.getElementById('btnUpdate');
+  if (bu) bu.onclick = async () => {
+    if (!confirm('从 GitHub 拉最新代码覆盖本地？\n\ncontrol.json / 密钥 / 日志都不会动，旧文件备份在 .bak-update/。')) return;
+    bu.disabled = true; bu.textContent = '更新中…';
+    const r = await jpost('/api/update', {});
+    bu.disabled = false; bu.textContent = '检查更新';
+    if (!r) { alert('连不上本地服务 8787'); return; }
+    if (!r.ok) { alert('更新失败：' + (r.err || '未知错误')); return; }
+    if (!r.n) { alert('已经是最新版，没有文件变化。'); return; }
+    alert('更新了 ' + r.n + ' 个文件：\n' + r.changed.slice(0, 12).join('\n') + (r.changed.length > 12 ? '\n…' : '') + '\n\n备份在 .bak-update/，重启 serve.cmd 生效。');
+  };
+  const br = document.getElementById('btnUsageReset');
+  if (br) br.onclick = async () => {
+    if (!confirm('用量清零？之后重新累计。')) return;
+    await jpost('/api/usage/reset', {});
+    location.reload();
+  };
+});
+
 async function jpost(p,body){ try{ const r = await fetch(API+p,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body||{})}); return await r.json(); }catch(e){ return null; } }
 
 function render(st){
   if(!st) return;
   const s = st.state || 'stopped';
+  const u = st.usage;
+  if (u && $('#chkUsage')) {
+    $('#chkUsage').textContent = u.calls
+      ? u.calls + ' 次 · ' + (u.in + u.out) + ' token · 约 ' + u.cost.toFixed(3) + ' 元'
+      : '还没用过';
+  }
   const dot = $('#dot'); dot.className = 'dot ' + (s==='running'?'run':s==='paused'?'pause':'stop');
   $('#stateText').textContent = {running:'运行中',paused:'已暂停',stopped:'已停止'}[s] || s;
   $('#curSec').textContent = st.section || '-';

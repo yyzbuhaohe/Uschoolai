@@ -11,6 +11,107 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 _MODEL = None
 
+USAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'usage.json')
+
+
+def api_usage():
+    """从 usage.json 读累计用量，顺带算钱（DeepSeek 现价：输入 2 元/百万，输出 8 元/百万）"""
+    u = _read_json(USAGE, {})
+    pin = int(u.get('in', 0) or 0)
+    pout = int(u.get('out', 0) or 0)
+    calls = int(u.get('calls', 0) or 0)
+    cost = pin * 2.0 / 1e6 + pout * 8.0 / 1e6
+    return {
+        'calls': calls,
+        'in': pin,
+        'out': pout,
+        'cost': round(cost, 4),
+        'since': u.get('since', ''),
+    }
+
+
+def api_usage_reset():
+    _write_json(USAGE, {'calls': 0, 'in': 0, 'out': 0, 'since': time.strftime('%Y-%m-%d %H:%M')})
+    return {'ok': True}
+
+
+REPO_ZIP = 'https://github.com/yyzbuhaohe/Uschoolai/archive/refs/heads/main.zip'
+
+
+def api_update():
+    """从 GitHub 拉最新代码覆盖本地。只动代码和文档，control.json / state.json / usage.json 一律不碰。"""
+    import io, zipfile
+    import urllib.request as _u
+    keep = {'control.json', 'state.json', 'usage.json', 'logs'}
+    bak = os.path.join(ROOT, '.bak-update')
+    changed, failed = [], []
+    try:
+        req = _u.Request(REPO_ZIP, headers={'User-Agent': 'potato-updater'})
+        raw = _u.urlopen(req, timeout=60).read()
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except Exception as e:
+        return {'ok': False, 'err': '下载失败：%s' % str(e)[:160]}
+
+    try:
+        os.makedirs(bak, exist_ok=True)
+    except Exception:
+        pass
+
+    # 先看远端版本，比本地旧就不覆盖（防止把新功能刷回旧版）
+    try:
+        remote_ver = json.loads(zf.read([n for n in zf.namelist() if n.endswith('/version.json')][0]).decode('utf-8'))
+        remote_build = int(remote_ver.get('build', 0) or 0)
+    except Exception:
+        remote_build = 0
+    try:
+        local_build = int(_read_json(os.path.join(ROOT, 'version.json'), {}).get('build', 0) or 0)
+    except Exception:
+        local_build = 0
+    if remote_build and local_build and remote_build <= local_build:
+        return {'ok': True, 'n': 0, 'changed': [], 'msg': '本地 %d，远端 %d，已是最新或更新' % (local_build, remote_build)}
+
+    for item in zf.infolist():
+        if item.is_dir():
+            continue
+        parts = item.filename.split('/', 1)
+        if len(parts) != 2:
+            continue
+        rel = parts[1]
+        head = rel.split('/')[0]
+        if head in keep:
+            continue
+        if rel.endswith('.pyc') or '__pycache__' in rel:
+            continue
+        dst = os.path.join(ROOT, rel.replace('/', os.sep))
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True) if os.path.dirname(dst) else None
+            old = None
+            if os.path.exists(dst):
+                with open(dst, 'rb') as f:
+                    old = f.read()
+            new = zf.read(item)
+            if old == new:
+                continue
+            if old is not None:
+                b = os.path.join(bak, rel.replace('/', '_'))
+                with open(b, 'wb') as f:
+                    f.write(old)
+            with open(dst, 'wb') as f:
+                f.write(new)
+            changed.append(rel)
+        except Exception as e:
+            failed.append('%s: %s' % (rel, str(e)[:60]))
+
+    if failed:
+        return {'ok': False, 'err': '部分文件失败：' + '; '.join(failed[:3]), 'changed': changed}
+    if remote_build:
+        try:
+            _write_json(os.path.join(ROOT, 'version.json'), remote_ver)
+        except Exception:
+            pass
+    return {'ok': True, 'changed': changed, 'n': len(changed), 'backup': bak, 'build': remote_build}
+
+
 def get_model():
     global _MODEL
     if _MODEL is None:
@@ -232,6 +333,7 @@ def api_state():
         pass
     st['stt'] = _MODEL is not None
     st['runner'] = runner_alive()
+    st['usage'] = api_usage()
     # 进程没了就别再显示「运行中」
     if not st['runner'] and st.get('state') == 'running':
         st['state'] = 'stopped'
@@ -294,6 +396,14 @@ class H(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(outb)
             return
+        if p == '/api/usage':
+            outb = json.dumps(api_usage(), ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(outb)))
+            self.end_headers()
+            self.wfile.write(outb)
+            return
         if p == '/api/log':
             try:
                 after = int(qs.get('after', '0'))
@@ -318,6 +428,24 @@ class H(http.server.SimpleHTTPRequestHandler):
         p = self.path.split('?')[0]
         n = int(self.headers.get('content-length') or 0)
         body = self.rfile.read(n) if n else b'{}'
+        if p == '/api/update':
+            res = api_update()
+            outr = json.dumps(res, ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(outr)))
+            self.end_headers()
+            self.wfile.write(outr)
+            return
+        if p == '/api/usage/reset':
+            res = api_usage_reset()
+            outr = json.dumps(res, ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(outr)))
+            self.end_headers()
+            self.wfile.write(outr)
+            return
         if p == '/api/run':
             try:
                 data = json.loads(body.decode('utf-8') or '{}') if body else {}

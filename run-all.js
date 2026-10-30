@@ -34,9 +34,31 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function page(){const ts=await (await fetch(BASE+'/json/list')).json();const ps=ts.filter(t=>t.type==='page'&&t.webSocketDebuggerUrl);return ps.find(p=>/ucontent/.test(p.url))||ps[0];}
 function connect(u){return new Promise((res,rej)=>{const ws=new WebSocket(u);let seq=0;const w=new Map();ws.onmessage=e=>{let m;try{m=JSON.parse(e.data);}catch(x){return;}if(m.id&&w.has(m.id)){const h=w.get(m.id);w.delete(m.id);m.error?h.rej(new Error(JSON.stringify(m.error))):h.res(m.result);}};ws.onopen=()=>res({call:(mm,pp)=>new Promise((a,b)=>{const id=++seq;w.set(id,{res:a,rej:b});ws.send(JSON.stringify({id,method:mm,params:pp||{}}));}),close:()=>{try{ws.close();}catch(x){}}});ws.onerror=()=>rej(new Error('ws'));});}
+// ---- 用量统计 ----
+const USAGE_PATH = path.join(ROOT, 'usage.json');
+let USAGE = { calls: 0, in: 0, out: 0 };
+try {
+  const u0 = JSON.parse(fs.readFileSync(USAGE_PATH, 'utf8').replace(/^\uFEFF/, ''));
+  USAGE = { calls: +u0.calls || 0, in: +u0.in || 0, out: +u0.out || 0 };
+} catch (e) {}
+let usageDirty = false;
+function flushUsage() {
+  if (!usageDirty) return;
+  usageDirty = false;
+  try { fs.writeFileSync(USAGE_PATH, JSON.stringify(USAGE, null, 2), 'utf8'); } catch (e) {}
+}
+setInterval(flushUsage, 5000);
+process.on('exit', flushUsage);
+
 async function ask(p, s) {
   const r = await fetch('https://api.deepseek.com/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + KEY }, body: JSON.stringify({ model: 'deepseek-chat', temperature: 0, messages: [{ role: 'system', content: s }, { role: 'user', content: p }] }) });
   const j = await r.json();
+  if (j.usage) {
+    USAGE.calls += 1;
+    USAGE.in += +j.usage.prompt_tokens || 0;
+    USAGE.out += +j.usage.completion_tokens || 0;
+    usageDirty = true;
+  }
   return ((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '').trim();
 }
 
@@ -915,6 +937,11 @@ function solveBlank(stmt, passage) {
       STATE.state = 'paused'; saveState();
     }
     if (!(await nextSection())) { log('本节结束，无法继续'); break; }
+  }
+  flushUsage();
+  if (USAGE.calls > 0) {
+    const cost = USAGE.in * 2 / 1e6 + USAGE.out * 8 / 1e6;
+    log('本次累计 ' + USAGE.calls + ' 次调用，输入 ' + USAGE.in + ' / 输出 ' + USAGE.out + ' token，约 ' + cost.toFixed(3) + ' 元');
   }
   log('=== 跑完 ===');
   c.close();
