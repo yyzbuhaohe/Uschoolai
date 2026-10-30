@@ -9,6 +9,15 @@ FILES = ['potato-ui.user.js', 'potato-farm.user.js']
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
 
 os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+
+# 第一次运行没有 control.json 时给一份能用的默认值（老包里的默认值是一句中文口号，
+# 新用户会在讨论题里把它当答案交上去，所以这里默认给英文占位）
+DEFAULT_CTRL = {
+    'state': 'stopped', 'maxSec': 3, 'delay': 900, 'rate': 4, 'guess': True,
+    'fillerText': 'This is my answer to the question above.',
+    'commentText': 'This is my answer to the question above.',
+    'maxFail': 8, 'pauseEvery': 0,
+}
 _MODEL = None
 
 USAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'usage.json')
@@ -67,8 +76,11 @@ def api_update():
         local_build = int(_read_json(os.path.join(ROOT, 'version.json'), {}).get('build', 0) or 0)
     except Exception:
         local_build = 0
-    if remote_build and local_build and remote_build <= local_build:
-        return {'ok': True, 'n': 0, 'changed': [], 'msg': '本地 %d，远端 %d，已是最新或更新' % (local_build, remote_build)}
+    if not remote_build:
+        # 远端没有 version.json 就不知道谁新谁旧，宁可不更新
+        return {'ok': True, 'n': 0, 'changed': [], 'msg': '远端缺少 version.json，跳过更新以免把本地刷成旧版'}
+    if local_build and remote_build <= local_build:
+        return {'ok': True, 'n': 0, 'changed': [], 'msg': '本地 %d，远端 %d，已是最新' % (local_build, remote_build)}
 
     for item in zf.infolist():
         if item.is_dir():
@@ -113,11 +125,79 @@ def api_update():
 
 
 def get_model():
+    """加载转写模型。
+
+    优先级：
+      1. 项目目录下的 models/whisper-base.en/（用户解压模型包就有，不用联网）
+      2. 从镜像下载到 HF 缓存
+    """
     global _MODEL
-    if _MODEL is None:
-        from faster_whisper import WhisperModel
-        _MODEL = WhisperModel('base.en', device='cpu', compute_type='int8')
-    return _MODEL
+    if _MODEL is not None:
+        return _MODEL
+    if not fw_ok():
+        pyv = '%d.%d' % sys.version_info[:2]
+        raise RuntimeError(
+            '这台机器上的 Python %s 里没有 faster-whisper（3.13/3.14 装不上）。'
+            '跑一次 install.cmd 或 doctor.cmd，它会装好 Python 3.12 并把路径写进 py.path；'
+            '然后关掉这个窗口重新开 serve.cmd。' % pyv)
+    from faster_whisper import WhisperModel
+
+    local = os.path.join(ROOT, 'models', 'whisper-base.en')
+    if os.path.isfile(os.path.join(local, 'model.bin')):
+        try:
+            _MODEL = WhisperModel(local, device='cpu', compute_type='int8')
+            print('[stt] model loaded from local: %s' % local, flush=True)
+            return _MODEL
+        except Exception as e:
+            print('[stt] local model failed, fall back to download: %s' % str(e)[:160], flush=True)
+
+    mirrors = ['https://hf-mirror.com', 'https://huggingface.co']
+    last = None
+    for m in mirrors:
+        os.environ['HF_ENDPOINT'] = m
+        for attempt in range(2):
+            try:
+                _MODEL = WhisperModel('base.en', device='cpu', compute_type='int8')
+                print('[stt] model ready via %s' % m, flush=True)
+                return _MODEL
+            except Exception as e:
+                last = e
+                print('[stt] %s attempt %d failed: %s' % (m, attempt + 1, str(e)[:160]), flush=True)
+                time.sleep(2)
+    raise RuntimeError('Whisper 模型加载失败（镜像都试过了）：%s' % str(last)[:200])
+
+_FW = {'ok': None}
+
+
+def fw_ok():
+    """faster-whisper 到底能不能 import —— 装没装、装坏了、Python 版本不对，一眼看出来"""
+    if _FW['ok'] is None:
+        try:
+            import faster_whisper  # noqa: F401
+            _FW['ok'] = True
+        except Exception:
+            _FW['ok'] = False
+    return _FW['ok']
+
+
+def model_state():
+    """local=项目里自带模型；hub=HF 缓存里有；none=都没有（跟读/排序/配音会挂）"""
+    if os.path.isfile(os.path.join(ROOT, 'models', 'whisper-base.en', 'model.bin')):
+        return 'local'
+    hub = os.path.join(os.path.expanduser('~'), '.cache', 'huggingface', 'hub')
+    try:
+        for n in os.listdir(hub):
+            if n.startswith('models--Systran--faster-whisper-base.en'):
+                return 'hub'
+    except Exception:
+        pass
+    return 'none'
+
+
+def ensure_control():
+    if not os.path.exists(CTRL):
+        _write_json(CTRL, DEFAULT_CTRL)
+
 
 def stt(url):
     import tempfile, urllib.request
@@ -316,8 +396,8 @@ def api_state():
         'delay': ctrl.get('delay', 900),
         'rate': ctrl.get('rate', 4),
         'maxSec': ctrl.get('maxSec', 8),
-        'fillerText': ctrl.get('fillerText', '关注塔菲谢谢喵！'),
-        'commentText': ctrl.get('commentText', '关注塔菲谢谢喵！'),
+        'fillerText': ctrl.get('fillerText', 'I think this unit is interesting and useful.'),
+        'commentText': ctrl.get('commentText', 'I think this unit is interesting and useful.'),
         'hasKey': bool(ctrl.get('apiKeyEnc') or ctrl.get('apiKey')),
         'autoResume': ctrl.get('autoResume', True),
         'maxFail': ctrl.get('maxFail', 5),
@@ -332,6 +412,9 @@ def api_state():
     except Exception:
         pass
     st['stt'] = _MODEL is not None
+    st['py'] = '%d.%d.%d' % sys.version_info[:3]
+    st['fw'] = fw_ok()          # faster-whisper 装好了没
+    st['model'] = model_state() # local / hub / none
     st['runner'] = runner_alive()
     st['usage'] = api_usage()
     # 进程没了就别再显示「运行中」
@@ -345,6 +428,79 @@ def api_state():
         except Exception:
             pass
     return st
+
+def _node_info():
+    """node 版本 + 有没有全局 WebSocket（21 以下没有，run-all/potato-watch 会当场崩）"""
+    node = shutil.which('node')
+    if not node:
+        return None, False
+    try:
+        ver = subprocess.run([node, '-v'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+                             creationflags=(0x08000000 if os.name == 'nt' else 0)).stdout.decode().strip()
+    except Exception:
+        return None, False
+    try:
+        r = subprocess.run([node, '-e', 'process.exit(typeof WebSocket === "function" ? 0 : 1)'],
+                           timeout=15, creationflags=(0x08000000 if os.name == 'nt' else 0))
+        return ver, r.returncode == 0
+    except Exception:
+        return ver, False
+
+
+def api_selfcheck():
+    """一键体检：新用户出问题先看这个，比翻日志快"""
+    checks = []
+
+    def add(cid, level, msg):
+        checks.append({'id': cid, 'level': level, 'msg': msg})
+
+    pv = sys.version_info
+    pyv = '%d.%d.%d' % pv[:3]
+    if pv.minor >= 13:
+        add('python', 'error', 'Python %s 装不上 faster-whisper（要 3.10~3.12）。跑 install.cmd 或 doctor.cmd' % pyv)
+    elif pv.minor <= 8:
+        add('python', 'warn', 'Python %s 偏旧，建议 3.12' % pyv)
+    else:
+        add('python', 'ok', 'Python %s' % pyv)
+
+    if fw_ok():
+        add('faster-whisper', 'ok', '已安装')
+    else:
+        add('faster-whisper', 'error', '当前 Python 里没有 faster-whisper，转写全不可用')
+
+    ms = model_state()
+    if ms == 'local':
+        add('model', 'ok', '项目内 models/whisper-base.en')
+    elif ms == 'hub':
+        add('model', 'ok', 'HF 缓存里有（首次转写会读盘加载）')
+    else:
+        add('model', 'warn', '没有语音模型：把 whisper-base.en.zip 放项目根目录重跑 install.cmd，或让它下载')
+
+    ver, ws = _node_info()
+    if not ver:
+        add('node', 'error', '找不到 node，run-all.js / potato-watch.js 都起不来')
+    elif not ws:
+        add('node', 'error', 'Node %s 没有全局 WebSocket，必须 22 以上（winget install OpenJS.NodeJS.LTS）' % ver)
+    else:
+        add('node', 'ok', 'Node %s（WebSocket 可用）' % ver)
+
+    try:
+        import urllib.request as _u
+        _u.urlopen('http://127.0.0.1:9222/json/version', timeout=2).read()
+        add('cdp', 'ok', '调试端口 9222 已连上')
+    except Exception:
+        add('cdp', 'error', '连不上 9222：先双击 start-chrome.cmd，再在调试窗口里登录 U 校园')
+
+    ctrl = _read_json(CTRL, {})
+    if ctrl.get('apiKeyEnc') or ctrl.get('apiKey'):
+        add('key', 'ok', 'API Key 已保存')
+    else:
+        add('key', 'error', '还没填 DeepSeek API Key（docs/API-KEY.md）')
+
+    bad = [c for c in checks if c['level'] == 'error']
+    warn = [c for c in checks if c['level'] == 'warn']
+    return {'ok': not bad, 'errors': len(bad), 'warns': len(warn), 'checks': checks}
+
 
 def api_log(after):
     try:
@@ -390,6 +546,14 @@ class H(http.server.SimpleHTTPRequestHandler):
                     qs[k] = v
         if p == '/api/state':
             outb = json.dumps(api_state(), ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(outb)))
+            self.end_headers()
+            self.wfile.write(outb)
+            return
+        if p == '/api/selfcheck':
+            outb = json.dumps(api_selfcheck(), ensure_ascii=False).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(outb)))
@@ -623,8 +787,31 @@ class H(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+class Srv(socketserver.ThreadingTCPServer):
+    # 这两个必须在 bind 之前就位：allow_reuse_address 写在实例上是无效的，
+    # 之前那样写会让「关掉再开」经常报 WinError 10048 / Address already in use。
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 if __name__ == '__main__':
-    with socketserver.ThreadingTCPServer(('127.0.0.1', PORT), H) as httpd:
-        httpd.allow_reuse_address = True
-        print(f'http://127.0.0.1:{PORT}  日志目录 {LOGD}')
+    ensure_control()
+    if not fw_ok():
+        print('[!] 当前 Python %d.%d 里没有 faster-whisper（3.13/3.14 装不上）。' % sys.version_info[:2], flush=True)
+        print('    服务能起来，但转写 / 排序 / 跟读 / 配音都用不了。', flush=True)
+        print('    修法：双击 doctor.cmd（或 install.cmd）装好 Python 3.12 再重开本窗口。', flush=True)
+    if model_state() == 'none':
+        print('[!] 没找到语音模型：models/whisper-base.en 不存在，首次转写会尝试联网下载 140MB。', flush=True)
+    try:
+        httpd = Srv(('127.0.0.1', PORT), H)
+    except OSError as ex:
+        print('', flush=True)
+        print('[X] 端口 %d 起不来：%s' % (PORT, ex), flush=True)
+        print('    多半是已经有一个 serve.cmd 在跑了（一个就够，别开第二个）。', flush=True)
+        print('    想确认： netstat -ano | findstr :%d' % PORT, flush=True)
+        sys.exit(3)
+    print(f'http://127.0.0.1:{PORT}  日志目录 {LOGD}', flush=True)
+    try:
         httpd.serve_forever()
+    except KeyboardInterrupt:
+        print('\n[停止] 本地服务关闭', flush=True)

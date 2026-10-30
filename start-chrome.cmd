@@ -1,25 +1,64 @@
 @echo off
-chcp 65001 >nul
+setlocal EnableExtensions
 cd /d "%~dp0"
 
-set CHROME="C:\Program Files\Google\Chrome\Application\chrome.exe"
-if not exist %CHROME% set CHROME="C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-if not exist %CHROME% (
-  echo 没找到 Chrome，试试 Edge 版 open-edge-debug.cmd
+rem Chrome 136+ only allows remote debugging with a separate profile dir.
+rem Old script used C:\chrome-debug: a normal (non-admin) user cannot create
+rem a folder in the drive root, so the browser silently fell back to the
+rem default profile and port 9222 never opened. Use LOCALAPPDATA instead.
+set "PORT=9222"
+set "PROFILE=%LOCALAPPDATA%\potato-debug\chrome"
+
+set "CHROME="
+for %%P in ("%ProgramFiles%\Google\Chrome\Application\chrome.exe" "%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe" "%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe") do (
+  if not defined CHROME if exist "%%~P" set "CHROME=%%~P"
+)
+if not defined CHROME (
+  echo [X] Chrome not found.
+  echo     Use open-edge-debug.cmd to run with Edge instead.
   pause
   exit /b 1
 )
 
-echo 正在启动调试版 Chrome ...
-echo 用户目录: C:\chrome-debug
-echo 调试端口: 9222
-echo.
+call :portopen %PORT%
+if "%OPEN%"=="1" (
+  echo Debug port %PORT% is already listening - reuse the running window.
+) else (
+  echo Starting Chrome with remote debugging ...
+  echo   profile : %PROFILE%
+  echo   port    : %PORT%
+  if not exist "%PROFILE%" mkdir "%PROFILE%" >nul 2>&1
+  start "" "%CHROME%" --remote-debugging-port=%PORT% --user-data-dir="%PROFILE%" --remote-allow-origins=* --no-first-run --no-default-browser-check --disable-features=Translate,MediaRouter
+  call :waitport %PORT% 25
+)
 
-start "" %CHROME% --remote-debugging-port=9222 --user-data-dir=C:\chrome-debug --no-first-run --no-default-browser-check
+call :portopen %PORT%
+if "%OPEN%"=="1" (
+  echo [OK] CDP %PORT% ready.
+) else (
+  echo [X] Port %PORT% still closed.
+  echo     Close every Chrome window of this profile and run this file again.
+  echo     Also check that no other program is using %PORT%.
+  pause
+  exit /b 1
+)
 
-timeout /t 3 >nul
-echo 验证:
-curl -s http://127.0.0.1:9222/json/version | more
 echo.
-echo 如果上面出现 JSON，说明端口通了。
-pause
+echo Next: log in to U Campus in THIS window, open a course page, keep it open.
+if /i not "%1"=="/q" pause
+exit /b 0
+
+:portopen
+set "OPEN=0"
+for /f %%R in ('powershell -NoProfile -Command "try{$c=New-Object Net.Sockets.TcpClient;$c.Connect('127.0.0.1',%1);$c.Close();'1'}catch{'0'}"') do set "OPEN=%%R"
+exit /b 0
+
+:waitport
+set /a _n=0
+:waitloop
+call :portopen %1
+if "%OPEN%"=="1" exit /b 0
+set /a _n+=1
+if %_n% GEQ %2 exit /b 1
+ping -n 2 127.0.0.1 >nul
+goto waitloop

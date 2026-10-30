@@ -62,13 +62,55 @@ async function ask(p, s) {
   return ((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '').trim();
 }
 
+// ---- 启动自检：新人最常见的三件事（Node 太旧 / 浏览器没开调试端口 / 服务没起）在这里一次说清，
+// 别让它跑到 Runtime.evaluate 才崩，崩了还只写进 logs/runner.out，控制台一个字都看不到。 ----
+async function preflight() {
+  const fatal = [];
+  if (typeof fetch !== 'function') fatal.push('这个 Node 没有全局 fetch，需要 Node 18 以上');
+  if (typeof WebSocket !== 'function') fatal.push('这个 Node 没有全局 WebSocket，必须 22 以上（当前 ' + process.version + '）—— 跑 doctor.cmd 看怎么修');
+  if (fatal.length) { fatal.forEach(m => log('!! ' + m)); return 2; }
+
+  // 1) 调试浏览器
+  let tabs = null;
+  try {
+    const r = await fetch(BASE + '/json/list', { signal: AbortSignal.timeout(5000) });
+    tabs = await r.json();
+    log('CDP 已连上：' + tabs.filter(t => t.type === 'page').length + ' 个标签页');
+  } catch (e) {
+    log('!! 连不上调试浏览器 127.0.0.1:9222 —— 先双击 start-chrome.cmd（用 Edge 就 open-edge-debug.cmd），');
+    log('   在那个新窗口里登录 U 校园，再回到控制台点开始。');
+    return 2;
+  }
+  const cur = (tabs || []).filter(t => t.type === 'page' && /unipus/.test(t.url));
+  if (!cur.length) {
+    log('!! 调试浏览器里没有 U 校园页面');
+    (tabs || []).filter(t => t.type === 'page').slice(0, 5).forEach(t => log('   现在开着：' + String(t.url).slice(0, 90)));
+    log('   请在这个窗口打开课程内容页（停在要刷的那一节），再点开始。');
+    return 2;
+  }
+
+  // 2) 本地服务 / 转写 / 模型
+  try {
+    const r = await fetch(SRV + '/api/state', { signal: AbortSignal.timeout(5000) });
+    const st = await r.json();
+    log('本地服务 8787 正常（Python ' + (st.py || '?') + '）');
+    if (st.fw === false) log('!! 这台 Python 里没有 faster-whisper：转写全废 → 排序/跟读/说话/配音都会失败。跑 doctor.cmd 看修法');
+    if (st.model === 'none') log('!! 没找到语音模型 models/whisper-base.en：首次转写会联网下 140MB，网络不稳就先放 model zip');
+    if (st.paused) log('   当前是暂停状态，面板点「继续」才动');
+  } catch (e) {
+    log('   [warn] 本地服务 8787 连不上：不影响单选/填空，但转写相关的题型（排序/跟读/说话/配音）会失败');
+    log('          修法：双击 serve.cmd，窗口留着别关');
+  }
+  return 0;
+}
+
 (async () => {
   const maxSec = Number(process.argv[2] || 3);
   // --here：只跑当前这一屏，不遍历整节的 tab/task（调试和快速验证用）
   const HERE_ONLY = process.argv.includes('--here');
   const _c0 = readCtrl();   // 统一走带 BOM 兼容的读取
-  const FILLER_TEXT = _c0.fillerText || '关注塔菲谢谢喵！';
-  const COMMENT_TEXT = _c0.commentText || '关注塔菲谢谢喵！';
+  const FILLER_TEXT = _c0.fillerText || 'I think this unit is interesting and useful.';
+  const COMMENT_TEXT = _c0.commentText || 'I think this unit is interesting and useful.';
   const MAX_FAIL = Number(_c0.maxFail || 5);
   const PAUSE_EVERY = Number(_c0.pauseEvery || 0);
   // Key 可能是加密的（apiKeyEnc），也可能是旧版明文（apiKey）或环境变量
@@ -83,6 +125,7 @@ async function ask(p, s) {
     log('!! 没配 DeepSeek API Key —— 获取方法见 docs/API-KEY.md，填到土豆面板的「模型」框，或写进 control.json 的 apiKey');
     process.exit(1);
   }
+  if (await preflight()) process.exit(2);
   const c = await connect((await page()).webSocketDebuggerUrl);
   const ev = async e => { const r = await c.call('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true }); if (r && r.exceptionDetails) return 'EXC'; return r && r.result ? r.result.value : undefined; };
   const unblock = async () => {
@@ -309,22 +352,36 @@ function solveBlank(stmt, passage) {
     log('    口稿 ' + script.split(/\s+/).length + ' 词');
     const { execFileSync } = require('child_process');
     const smoke = path.join(ROOT, 'speak.wav');
+    // 音色不能写死 Microsoft Zira Desktop：中文版 Windows 默认只带 Huihui，
+    // 写死的话 SelectVoice 直接抛异常，说话题/跟读题全废（日志里只有一行「TTS 失败」）。
     const ps = [
       'Add-Type -AssemblyName System.Speech',
       '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
-      '$s.SelectVoice("Microsoft Zira Desktop")',
+      '$vs = @($s.GetInstalledVoices() | Where-Object { $_.Enabled } | ForEach-Object { $_.VoiceInfo })',
+      '$pick = $vs | Where-Object { $_.Culture.Name -eq "en-US" -and $_.Name -match "Zira|Aria|Guy|Jenny" } | Select-Object -First 1',
+      'if (-not $pick) { $pick = $vs | Where-Object { $_.Culture.Name -eq "en-US" } | Select-Object -First 1 }',
+      'if (-not $pick) { $pick = $vs | Where-Object { $_.Culture.Name -like "en*" } | Select-Object -First 1 }',
+      'if ($pick) { try { $s.SelectVoice($pick.Name) } catch {} }',
       '$s.Rate = 0',
       'if (Test-Path "' + smoke + '") { Remove-Item "' + smoke + '" -Force }',
       '$s.SetOutputToWaveFile("' + smoke + '")',
       '$s.Speak([IO.File]::ReadAllText("' + path.join(ROOT, 'tts-script.txt') + '"))',
+      'Write-Output ("VOICE=" + $s.Voice.Name + "|" + $s.Voice.Culture.Name)',
       '$s.Dispose()'
     ].join('; ');
     try {
       require('fs').writeFileSync(path.join(ROOT, 'tts-script.txt'), script, 'utf8');
-      execFileSync('powershell', ['-NoProfile', '-Command', ps], { timeout: 120000 });
+      const outv = String(execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 180000, encoding: 'utf8' }) || '');
+      const mv = outv.match(/VOICE=([^\r\n|]+)\|([^\r\n]+)/);
       const sz = require('fs').statSync(smoke).size;
-      log('    TTS ' + sz + ' 字节');
-    } catch (e) { log('    TTS 失败 ' + e.message); return; }
+      log('    TTS ' + sz + ' 字节' + (mv ? '（音色 ' + mv[1] + ' / ' + mv[2] + '）' : ''));
+      if (sz < 2000) { log('    !! 音频几乎为空，这题录进去也没声'); return; }
+    } catch (e) {
+      log('    TTS 失败 ' + e.message);
+      log('    中文版 Windows 可能没装英文语音：设置 → 时间和语言 → 语言 → 添加语言 English (United States) → 勾「语音」');
+      log('    或者用 Edge 的英文音色顶一下：装完 Voice 后重跑本屏');
+      return;
+    }
     await ev("(function(){" +
       "window.__dubUrl='http://127.0.0.1:8787/speak.wav';window.__dubSegs=[{start:0,end:999,score:1}];window.__dubIdx=0;window.__dubLog=[];" +
       "var md=navigator.mediaDevices;var orig=md.getUserMedia?md.getUserMedia.bind(md):null;" +
@@ -945,4 +1002,11 @@ function solveBlank(stmt, passage) {
   }
   log('=== 跑完 ===');
   c.close();
-})();
+})().catch(e => {
+  // 顶层的任何异常都要落进 run-all.log，否则新人只看到面板「运行中」而日志一片空白
+  const msg = e && e.stack ? String(e.stack).split('\n').slice(0, 4).join(' | ') : String(e);
+  log('!! 异常退出：' + msg);
+  log('   如果是 connect/ws 相关：确认 start-chrome.cmd 那个窗口还开着、期间没关过浏览器');
+  try { fs.writeFileSync(STATE_PATH, JSON.stringify(Object.assign(STATE, { state: 'stopped', err: msg })), 'utf8'); } catch (x) {}
+  process.exit(1);
+});

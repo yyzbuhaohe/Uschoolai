@@ -20,10 +20,18 @@ const SRC = {
   dub: { file: path.join(ROOT, 'dub-hook.js'), marker: '__potatoDub' },
 };
 
+try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); } catch (e) {}
+
 function log(m) {
   const line = '[' + new Date().toLocaleTimeString() + '] ' + m;
   console.log(line);
   try { fs.appendFileSync(LOG, line + '\n'); } catch (e) {}
+}
+
+if (typeof WebSocket !== 'function') {
+  log('!! 这个 Node 没有全局 WebSocket（' + process.version + '），注入守护起不来');
+  log('   需要 Node 22 以上：winget install OpenJS.NodeJS.LTS，然后重开这个窗口');
+  process.exit(2);
 }
 
 function call(wsUrl, method, params) {
@@ -67,7 +75,16 @@ async function tick() {
     if (Date.now() - lastLog > 60000) { lastLog = Date.now(); log('!! 连不上 CDP 9222，等它起来'); }
     return;
   }
-  const pages = list.filter(t => t.type === 'page' && t.webSocketDebuggerUrl && /ucontent\.unipus\.cn/.test(t.url));
+  // 别只认 ucontent.unipus.cn：登录页 / 新域名 / 学校定制入口都在 unipus.cn 下，
+  // 新用户照着文档打开页面却看不到土豆，多半是这一条匹配太窄。
+  const pages = list.filter(t => t.type === 'page' && t.webSocketDebuggerUrl && /unipus\.cn/.test(t.url));
+  if (!pages.length && Date.now() - lastLog > 30000) {
+    lastLog = Date.now();
+    const others = list.filter(t => t.type === 'page' && t.webSocketDebuggerUrl);
+    log('没有找到 U 校园页面（当前 ' + others.length + ' 个标签页）');
+    others.slice(0, 4).forEach(t => log('  - ' + String(t.url).slice(0, 80)));
+    log('  在调试版浏览器里打开课程内容页，2 秒内会自动注入');
+  }
   for (const p of pages) {
     // 配音题的音频旁路必须赶在页面脚本之前 —— 注册成「每次导航前先跑」
     const dk = p.id + ':dubscript';

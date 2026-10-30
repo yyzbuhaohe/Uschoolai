@@ -78,12 +78,15 @@ if ($All) {
   Write-Host ""
   Write-Host "  正在清理 -All 项目…" -ForegroundColor Cyan
 
-  if (Test-Path 'C:\chrome-debug') {
-    if ($DryRun) { Dry "会删除 C:\chrome-debug" }
+  # 新版调试配置在 %LOCALAPPDATA%\potato-debug；老版本在 C:\chrome-debug / C:\edge-debug，都清
+  $profiles = @((Join-Path $env:LOCALAPPDATA 'potato-debug'), 'C:\chrome-debug', 'C:\edge-debug')
+  foreach ($prof in $profiles) {
+    if (-not (Test-Path $prof)) { continue }
+    if ($DryRun) { Dry ('会删除 ' + $prof) }
     else {
-      Remove-Item 'C:\chrome-debug' -Recurse -Force -ErrorAction SilentlyContinue
-      if (Test-Path 'C:\chrome-debug') { Warn "C:\chrome-debug 删不掉，浏览器可能还开着" }
-      else { Ok "删除浏览器调试目录 C:\chrome-debug" }
+      Remove-Item $prof -Recurse -Force -ErrorAction SilentlyContinue
+      if (Test-Path $prof) { Warn ($prof + ' 删不掉，浏览器可能还开着') }
+      else { Ok ('删除浏览器调试目录 ' + $prof) }
     }
   }
 

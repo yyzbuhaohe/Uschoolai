@@ -75,36 +75,57 @@ ucontent.unipus.cn 的课程页面
 
 ### 0. 准备
 
-- Windows 10/11
-- Python 3.11 或 3.12（**3.13 装不上 faster-whisper**）
-- Chrome 或 Edge
+- Windows 10/11 x64
+- Chrome 或 Edge（有一个就行）
 - 一个 DeepSeek API Key（[怎么拿](docs/API-KEY.md)）
+- 磁盘留 2GB
 
-把整个文件夹放到**路径不带中文和空格**的地方，比如 `D:\unipus`。
+**Node 和 Python 不用自己装**，`install.cmd` 会搞定：Node 22（便携版，不要管理员权限）、Python 3.12、faster-whisper、Whisper 模型，还会把桌面快捷方式建好。
 
-### 1. 一键装环境
+> 建议把整个文件夹放在**路径不带中文和空格**的地方（比如 `D:\unipus`）。带空格能跑（脚本都加了引号），带中文容易出玄学问题。
 
-双击 `install.cmd`。
+### 1. 双击 install.cmd
 
-它会：装 Python 依赖（faster-whisper、Flask 等）→ 预下载语音模型 → 检查文件齐不齐 → 建桌面快捷方式。
+它会按顺序做这些事，每一步都告诉你结果：
 
-### 2. 开一个调试浏览器
+| 步骤 | 干什么 | 不满足会怎样 |
+|---|---|---|
+| 0 | 看 Windows 版本、架构、磁盘、路径 | 只提示，不拦 |
+| 1 | Node **≥22**（20 没有全局 WebSocket，代码跑不起来） | 自动下便携版解压到 `%LOCALAPPDATA%\Programs\nodejs` |
+| 2 | Python **3.10~3.12**（3.13/3.14 装不上 faster-whisper） | 不动你现有的 3.13/3.14，另装一个 3.12.7 |
+| 3 | faster-whisper==1.0.3，装完**真的 import 一遍**验证 | 报 VC++ 运行库 / 换源的提示 |
+| 4 | Whisper 模型：项目里有 `whisper-base.en.zip` 就**自动解压**，没有才联网下 | 失败会给"放 zip 到哪"的原文说明 |
+| 5 | 系统英文音色（跟读/说话题要用 TTS） | 中文版 Windows 常常没有 → 给安装步骤 |
+| 6 | Chrome / Edge | 都没有就报错 |
+| 7 | 核心文件自检 | 缺文件提醒重新解压 |
+| 8 | 首次配置 + 桌面快捷方式 | — |
 
-双击 `start-chrome.cmd`（用 Edge 就双击 `open-edge-debug.cmd`）。
+装完的结论只有两种：`环境就绪`，或者「还有 N 个问题」逐条列出修法。全程记录在 `install-log.txt`，出问题把这份发出来就行。
 
-会开一个**独立的** Chrome 窗口，配置存在 `C:\chrome-debug`，跟你平时的浏览器互不干扰。第一次要在这个窗口里重新登录 U 校园。
+只想看状态、不想装东西：双击 `doctor.cmd`（只读体检）。
 
-### 3. 起服务
+**建议**：从群里下 `whisper-base.en.zip` 丢到项目根目录再跑 `install.cmd`，它会自己解压到 `models\whisper-base.en`，省掉 140MB 联网下载。
 
-双击 `serve.cmd`，浏览器打开 <http://127.0.0.1:8787/> 就是控制台。
+### 2. 双击 start-all.cmd
 
-第一次进去填 API Key，它会加密存到 `control.json`（明文不落盘）。
+一个入口把该起的东西按正确顺序起好：
 
-### 4. 注入 + 开跑
+1. 开调试浏览器（独立配置，存在 `%LOCALAPPDATA%\potato-debug\chrome`，跟你平时的浏览器互不干扰）
+2. 起本地服务 `serve.py`（8787）
+3. 起注入守护 `potato-watch.js`
+4. 打开控制台 <http://127.0.0.1:8787/>
 
-双击 `potato-watch.cmd`（保持窗口开着），然后回控制台点「开始」。
+每一步都会先探端口：已经起着就直接复用，不会重复开。全停用 `stop-all.cmd`。
 
-之后它自己一屏一屏往下做。
+### 3. 填 Key，点开始
+
+调试浏览器窗口里登录 U 校园 → 进到课程内容页（停在要刷的那一节）。
+
+回到控制台填 DeepSeek API Key（加密存进 `control.json`，明文不落盘），设个「跑到第几节」，「开始」。
+
+之后它自己一屏一屏往下做。右下角还有颗土豆面板，功能一样，随便用哪个。
+
+> 手动起也行，顺序必须是：`start-chrome.cmd` → `serve.cmd` → `potato-watch.cmd`，三个窗口都别关。顺序错了或漏了，会出现"点开始没反应""面板不出来"。
 
 ---
 
@@ -121,6 +142,8 @@ ucontent.unipus.cn 的课程页面
 | `keyvault.js` | API Key 加解密（AES-256-GCM，密钥绑机器） |
 | `ui.html` | 控制台页面 |
 | `install.ps1` / `uninstall.ps1` | 一键安装 / 卸载 |
+| `start-all.cmd` / `stop-all.cmd` | 一键开跑 / 一键全停 |
+| `doctor.cmd` | 只读体检（= `install.ps1 -CheckOnly`） |
 | `docs/` | 详细文档 |
 
 ---
@@ -129,16 +152,24 @@ ucontent.unipus.cn 的课程页面
 
 - [环境配置](docs/SETUP.md)
 - [API Key](docs/API-KEY.md)
+- [Whisper 模型包](docs/MODEL.md)
 - [浏览器与兼容性](docs/BROWSER.md)
 - [题型说明](docs/TYPES.md)
 - [口语题原理](docs/VOICE.md)
 - [排序题原理](docs/SORT-MATCH.md)
+- [排障手册](docs/TROUBLESHOOT.md)
 - [卸载](docs/UNINSTALL.md)
 - [已知问题](docs/TODO.md)
+- **[交接文档](docs/HANDOFF.md)**（要改代码先看这个）
 
 ---
 
 ## 常见问题
+
+完整版见 [排障手册](docs/TROUBLESHOOT.md)。出任何问题先双击 `doctor.cmd`，它会告诉你缺什么。
+
+**点开始没反应 / 日志一片空白**
+控制台日志区只显示 `run-all.log`；进程自己崩在启动阶段时看上一条。现在启动会先自检，日志第一行就会写清是 Node 太旧、9222 没开、还是 8787 没起。
 
 **「录音启动超时」**
 页面点录音后 15 秒内收不到音频数据就会弹这个。检查 `potato-watch.cmd` 是不是在跑（它负责注入钩子），或者重启一次服务。
@@ -153,6 +184,21 @@ ucontent.unipus.cn 的课程页面
 
 **能同时开两个吗**
 不能。一个调试端口只能挂一个会话。
+
+---
+
+## 用量与更新
+
+**看花了多少钱**
+控制台「环境检查」里有一行「模型用量」：跑了多少次调用、多少 token、折算多少钱。点「清零用量」重新计。
+
+**脚本自动更新**
+控制台点「检查更新」，它从 GitHub 拉最新代码覆盖本地。
+
+- 只更新代码和文档，`control.json`（含你的 key）、`state.json`、日志一律不碰
+- 覆盖前会把旧文件备份到 `.bak-update/`
+- 有版本比对：远端 `version.json` 的 build 号不比本地新就不动（防止把新功能刷回旧版）
+- 更新完重启 `serve.cmd` 生效
 
 ---
 

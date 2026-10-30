@@ -190,8 +190,8 @@
         <div class="p-tip" id="p-tip">等待开始</div>
 
         <div class="p-sec-title">文案</div>
-        <textarea class="p-text" id="p-filler" rows="1" placeholder="主观题填什么">关注塔菲谢谢喵！</textarea>
-        <textarea class="p-text" id="p-comment" rows="1" placeholder="讨论区评论什么">关注塔菲谢谢喵！</textarea>
+        <textarea class="p-text" id="p-filler" rows="1" placeholder="主观题填什么">I think this unit is interesting and useful.</textarea>
+        <textarea class="p-text" id="p-comment" rows="1" placeholder="讨论区评论什么">I think this unit is interesting and useful.</textarea>
 
         <div class="p-sec-title">挂机</div>
         <div class="p-row"><span>跑到第几节后停</span><input type="number" id="p-max" value="8" min="1" max="275"></div>
@@ -431,8 +431,8 @@
       delay: Number($('#p-delay').value) || 900,
       rate: Number($('#p-rate').value) || 4,
       guess: $('#p-guess').checked,
-      fillerText: $('#p-filler').value || '关注塔菲谢谢喵！',
-      commentText: $('#p-comment').value || '关注塔菲谢谢喵！',
+      fillerText: $('#p-filler').value || 'I think this unit is interesting and useful.',
+      commentText: $('#p-comment').value || 'I think this unit is interesting and useful.',
       maxFail: Number($('#p-maxfail').value) || 5,
       pauseEvery: Number($('#p-pause-every').value) || 0,
       apiKey: $('#p-key').value.trim()

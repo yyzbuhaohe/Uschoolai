@@ -28,6 +28,10 @@ control.json.bak-*
 .DS_Store
 Thumbs.db
 
+# 安装向导日志 / 打包产物
+install-log.txt
+dist/
+
 # 调试输出
 *.out
 *.err

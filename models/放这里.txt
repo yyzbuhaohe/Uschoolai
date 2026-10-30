@@ -1,0 +1,1 @@
+﻿把 whisper-base.en.zip 解压到这个目录（结构：models\whisper-base.en\model.bin），或者把它丢到项目根目录让 install.cmd 自动解压。
