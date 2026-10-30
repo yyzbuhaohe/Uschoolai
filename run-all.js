@@ -205,14 +205,17 @@ function solveBlank(stmt, passage) {
   const type = t => c.call('Input.insertText', { text: t });
   const btn = async ws => { const v = await ev("(function(){var ws=" + JSON.stringify(ws) + ";var h=null;document.querySelectorAll('a,button,.ant-btn,div[role=button]').forEach(function(b){if(b.offsetParent===null)return;var t=String(b.textContent||'').replace(/\\s+/g,'');if(ws.indexOf(t)<0)return;var r=b.getBoundingClientRect();if(r.width<4)return;h={el:b,t:t}});if(h&&h.el){h.el.scrollIntoView({block:'center'});var rr=h.el.getBoundingClientRect();h={x:Math.round(rr.left+rr.width/2),y:Math.round(rr.top+rr.height/2),t:h.t}}return JSON.stringify(h)})()"); return v && v !== 'null' ? JSON.parse(v) : null; };
   const closeDlg = async () => { const d = await btn(['我知道了']); if (d) { await click(d.x, d.y); await sleep(800); return true; } return false; };
-  const kind = async () => JSON.parse(await ev("JSON.stringify({ins:document.querySelectorAll('.scoop-input-wrapper input').length,opt:document.querySelectorAll('.option').length,ta:[].slice.call(document.querySelectorAll('textarea')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>60&&r.height>20}).length,dd:[].slice.call(document.querySelectorAll('.ant-dropdown-trigger.user-answer')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();if(r.width<10||r.height<4)return false;if(r.top<0||r.bottom>window.innerHeight)return false;var box=e.closest('.question-common-abs-reply,.question,.answers-list,.layoutBody-container');if(!box)return false;var br=box.getBoundingClientRect();return br.width>50&&br.height>20}).length,qa:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;if(/评论/.test(t.placeholder||''))return false;if(t.closest('[class*=discussion]'))return false;var r=t.getBoundingClientRect();return r.width>60&&r.height>20}).length,cmt:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;var r=t.getBoundingClientRect();if(r.width<60||r.height<20)return false;return /评论/.test(t.placeholder||'')||!!t.closest('[class*=discussion]')}).length,up:(document.querySelector('.question-multi-file-upload')?1:0),sort:document.querySelectorAll('[class*=sequence-reply-view-item]').length,img:[].slice.call(document.querySelectorAll('.option img,.option-placeholder img')).filter(function(e){var o=e.closest('.option,.option-placeholder');if(!o||o.offsetParent===null)return false;var r=o.getBoundingClientRect();return r.width>4&&r.height>4}).length,sent:document.querySelectorAll('.sentence-container').length,rec:document.querySelectorAll('.record-icon.button-record').length,rev:document.querySelectorAll('.question-revise-mistake').length})") || '{}');
+  const kind = async () => JSON.parse(await ev("JSON.stringify({ins:[].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input,input.input-user-answer')).filter(function(e){return e.offsetParent!==null}).length,opt:document.querySelectorAll('.option').length,ta:[].slice.call(document.querySelectorAll('textarea')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>60&&r.height>20}).length,dd:[].slice.call(document.querySelectorAll('.ant-dropdown-trigger.user-answer')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();if(r.width<10||r.height<4)return false;if(r.top<0||r.bottom>window.innerHeight)return false;var box=e.closest('.question-common-abs-reply,.question,.answers-list,.layoutBody-container');if(!box)return false;var br=box.getBoundingClientRect();return br.width>50&&br.height>20}).length,qa:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;if(/评论/.test(t.placeholder||''))return false;if(t.closest('[class*=discussion]'))return false;var r=t.getBoundingClientRect();return r.width>60&&r.height>20}).length,cmt:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;var r=t.getBoundingClientRect();if(r.width<60||r.height<20)return false;return /评论/.test(t.placeholder||'')||!!t.closest('[class*=discussion]')}).length,up:(document.querySelector('.question-multi-file-upload')?1:0),sort:document.querySelectorAll('[class*=sequence-reply-view-item]').length,img:[].slice.call(document.querySelectorAll('.option img,.option-placeholder img')).filter(function(e){var o=e.closest('.option,.option-placeholder');if(!o||o.offsetParent===null)return false;var r=o.getBoundingClientRect();return r.width>4&&r.height>4}).length,sent:[].slice.call(document.querySelectorAll('.sentence-container')).filter(function(s){return !!s.querySelector('audio')}).length,sentAll:document.querySelectorAll('.sentence-container').length,rec:document.querySelectorAll('.record-icon.button-record').length,rev:document.querySelectorAll('.question-revise-mistake').length})") || '{}');
   const waitKind = async (maxMs = 8000) => {
     const t0 = Date.now();
     let last = null;
     while (Date.now() - t0 < maxMs) {
       const k = await kind();
       const key = JSON.stringify(k);
-      if (last === key) return k;
+      // 只"两次一样"不够：填空题第二页刚切过来时，页面上只有 4 个空壳 .sentence-container，
+      // ins/opt 全是 0，会被误判成跟读。所以要求「稳定 + 真的认得出东西」才返回。
+      const actionable = k.ins > 0 || k.opt > 0 || k.sent > 0 || k.rec > 0 || k.ta > 0 || k.sort > 0 || k.dd > 0 || k.up > 0 || k.rev > 0;
+      if (last === key && actionable) return k;
       last = key;
       await sleep(700);
     }
@@ -357,6 +360,10 @@ function solveBlank(stmt, passage) {
   // 否则弹「录音启动超时」。所以劫持里一被调用就 resume 音频上下文并立刻开播。
 
   async function doSpeak() {
+    // 说话题的判据只有"有录音按钮"太弱：填空页也常常带一个录音按钮（或骨架屏）。
+    // 页面上有可见的填空/翻译输入框，就一定不是自由说话。
+    const fillInputs = Number(await ev("(function(){return [].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input,input.input-user-answer')).filter(function(e){return e.offsetParent!==null}).length})()"));
+    if (fillInputs > 0) { log('    !! 这屏有 ' + fillInputs + ' 个填空输入框，不是说话题，交给 doFill'); await doFill({}); return; }
     const task = await ev("(function(){var t=String(document.body.innerText||'').replace(/\\s+/g,' ');var i=t.indexOf('Directions');var j=t.indexOf('提 交');return i>=0?t.slice(i,(j>i?j:i+700)):''})()");
     log('    说话题：' + String(task).slice(0, 60));
     const script = await ask('口语题：\n' + task + '\n\n写一段 90-110 词的英文口述稿，口语化、句子短、好朗读，只用纯英文，不要标题序号括注。', '只输出英文口述稿，一段话。');
@@ -533,7 +540,24 @@ function solveBlank(stmt, passage) {
     log('    选中 ' + done);
   }
   async function doFill(k) {
-    const stmts = JSON.parse(await ev("(function(){var o=[];var all=[].slice.call(document.querySelectorAll('.scoop-input-wrapper'));all.forEach(function(w){var box=w.closest('p')||w.parentElement;if(!box)return;var c=box.cloneNode(true);var ws=[].slice.call(c.querySelectorAll('.scoop-input-wrapper'));if(!ws.length)return;var orig=[].slice.call(box.querySelectorAll('.scoop-input-wrapper'));var idx=orig.indexOf(w);if(idx<0)idx=0;ws[idx].replaceWith(document.createTextNode(' __BLANK__ '));for(var i=0;i<ws.length;i++){if(i!==idx&&ws[i].parentNode)ws[i].parentNode.removeChild(ws[i])}o.push(String(c.textContent||'').replace(/\\s+/g,' ').trim())});return JSON.stringify(o)})()") || '[]');
+    // 空的容器：优先 .scoop-input-wrapper；整屏没有（新版页面用 .comp-abs-input）才退回
+    const stmts = JSON.parse(await ev('(function(){' +
+      'var SEL=".scoop-input-wrapper";' +
+      'var all=[].slice.call(document.querySelectorAll(SEL));' +
+      'if(!all.length){SEL=".comp-abs-input";all=[].slice.call(document.querySelectorAll(SEL))}' +
+      'var o=[];' +
+      'all.forEach(function(w){' +
+        'var box=w.closest("p")||w.parentElement;if(!box)return;' +
+        'var c=box.cloneNode(true);' +
+        'var ws=[].slice.call(c.querySelectorAll(SEL));if(!ws.length)return;' +
+        'var orig=[].slice.call(box.querySelectorAll(SEL));' +
+        'var idx=orig.indexOf(w);if(idx<0)idx=0;' +
+        'ws[idx].replaceWith(document.createTextNode(" __BLANK__ "));' +
+        'for(var i=0;i<ws.length;i++){if(i!==idx&&ws[i].parentNode)ws[i].parentNode.removeChild(ws[i])}' +
+        'o.push(String(c.textContent||"").replace(/\\s+/g," ").trim())' +
+      '});' +
+      'return JSON.stringify(o)' +
+    '})()') || '[]');
     if (!stmts.length) { log('    没解析到空'); return; }
 
     const dirs = await ev("(function(){var t=String(document.body.innerText||'').replace(/\\s+/g,' ');var i=t.indexOf('Directions');return i>=0?t.slice(i,i+200):''})()");
@@ -575,12 +599,12 @@ function solveBlank(stmt, passage) {
     log('    答案 ' + answers.map(a => a || '?').join(' | ').slice(0, 110));
     if (answers.filter(Boolean).length < stmts.length) { log('    答案不全，不提交'); return; }
     await ev("(function(){var a=" + JSON.stringify(answers) + ";" +
-      "var ins=[].slice.call(document.querySelectorAll('.scoop-input-wrapper input'));" +
+      "var ins=[].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input'));" +
       "ins.sort(function(p,q){if(Math.abs(p.offsetTop-q.offsetTop)>6)return p.offsetTop-q.offsetTop;return p.offsetLeft-q.offsetLeft});" +
       "var set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;" +
       "ins.forEach(function(e,i){set.call(e,a[i]||'');e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));e.dispatchEvent(new Event('blur',{bubbles:true}))})})()");
     await sleep(700);
-    const filled = await ev("(function(){return JSON.stringify([].slice.call(document.querySelectorAll('.scoop-input-wrapper input')).map(function(e){return e.value.slice(0,24)}))})()");
+    const filled = await ev("(function(){return JSON.stringify([].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input')).map(function(e){return e.value.slice(0,24)}))})()");
     log('    已填 ' + filled);
   }
   async function doDiscussion() {

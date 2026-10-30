@@ -15,6 +15,23 @@
 | 排序 | `sequence-reply-view-item` | 转写取时间轴 → 模型找证据句 → 按证据句时间拖拽 | **100** |
 | **改错** | `.question-revise-mistake` + 逐词 `.mistake-atom` | 转写 → 模型指出错词 → 点词 → change → 填词 → 提交 | 见下 |
 
+## 认屏：别用容器类名当题型
+
+**教训**：填空题第二页会用 `.sentence-container` 当骨架（4 个空壳、里面没有 `<audio>`），只看类名会把它判成跟读，然后去录"没有示范音"的句子。
+
+现在的判据：
+
+| 字段 | 怎么算 | 说明 |
+|---|---|---|
+| `ins` | `.scoop-input-wrapper input` + `.comp-abs-input input` + `input.input-user-answer`（只要可见的） | 填空/翻译 |
+| `sent` | `.sentence-container` **里必须有 `<audio>`** | 跟读 |
+| `sentAll` | `.sentence-container` 总数 | 只做诊断，不参与判定 |
+| `rec` | `.record-icon.button-record` | 说话/配音 |
+
+另外 `waitKind()` 以前"两次采样一样就返回"，页面还没渲染完时会返回一张全 0 的快照。现在要求**稳定 + 至少认出一类题型**才返回。
+
+`doSpeak()` 也加了兜底：页面上只要有可见填空框，就直接交给 `doFill()`。
+
 ## 跟读题（Vocabulary / read aloud）
 
 **一个页面只肯要一次麦克风。** 录完第一句之后，再点别的句子的麦克风，页面**根本不会调 `getUserMedia`**（实测 0 次调用，也没有任何提示），所以一屏 6 句只能拿到 1 句的分——这就是"跟读只对一道"的真正原因。

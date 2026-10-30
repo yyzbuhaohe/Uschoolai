@@ -450,7 +450,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .dev\make-pack.ps1 -Zip    #
 
 **注意**：页面只记第一次作答的分，这屏之前已经记成 16 分就补不回来了；改的是往后的屏。
 
-### 11.10 默认值
+### 11.10 题型判错的坑（v1.1.5）
+
+**现象**：填空页（`After you view / Exercise 1` 第 2 页，4 个翻译空）被当成跟读，日志刷"跟读 4 题 / 没有示范音（none）"。
+
+**根因**：`kind()` 里 `sent` 只数 `.sentence-container` 的个数，而填空题第二页也用这类容器做骨架（里面没有 `<audio>`）；`waitKind()` 又只要"两次采样一致"就返回，页面还没渲染完时拿到的是全 0 快照，直接进了跟读分支。
+
+**改法**：
+
+1. `sent` 改成"含 `<audio>` 的 `.sentence-container`"；另留 `sentAll` 只做诊断
+2. `ins` 放宽到 `.scoop-input-wrapper input` / `.comp-abs-input input` / `input.input-user-answer`（只算可见）
+3. `waitKind()` 要求"稳定 + 至少认出一类题型"（`actionable`），骨架屏继续等
+4. `doSpeak()` 兜底：有可见填空框就转 `doFill()`
+5. `doFill()` 的空容器优先 `.scoop-input-wrapper`，整屏没有才退回 `.comp-abs-input`——**不能用逗号选择器**，两种容器会嵌套，空格数会翻倍（当时报"8 空"，答案重复两遍）
+
+实测：同一屏现在判成 `{"ins":4,...,"sent":0}` → `非听力填空（翻译等），直接让模型作答 4 空`，答案正确、不重复。
+
+### 11.11 默认值
 
 `control.json` / `serve.py` / `run-all.js` / 面板里的主观题兜底文案，从 `关注塔菲谢谢喵！` 改成 `I think this unit is interesting and useful.` —— 之前新用户模型调用失败时，会把中文口号当答案交进英语讨论区。
 
