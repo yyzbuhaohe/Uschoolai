@@ -1,5 +1,5 @@
 {
-  "build": 2026103001,
-  "name": "v1.1.0",
-  "note": "安装器 v2（Node22/Python3.12 硬门 + 模型自动解压 + 语音体检）+ start-all 一键启动 + 启动自检"
+  "build": 2026103002,
+  "name": "v1.1.1",
+  "note": "修：serve.py 找不到 node 时点开始报 WinError 2（现在按 node.path/安装目录/PATH 依次找）"
 }

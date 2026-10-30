@@ -10,6 +10,8 @@ logs/
 *.crx
 
 # 运行期状态（含 API Key，绝不入库）
+py.path
+node.path
 control.json
 state.json
 control.json.bak-*

@@ -321,9 +321,34 @@ def _write_json(path, obj):
 # ---- 跑课进程托管：UI 点「开始」真的把 run-all.js 拉起来 ----
 RUNNER = {'proc': None, 'started': 0}
 
+def find_node():
+    """按 node.path → 常见安装目录 → PATH 的顺序找 node.exe。
+
+    这里原来只有 shutil.which('node') or 'node'：这个窗口的 PATH 里一旦没有 node
+    （比如不是从资源管理器双击、而是被别的程序拉起来的），点「开始」就会抛
+    FileNotFoundError: [WinError 2]，界面上只剩一句「启动失败」。
+    """
+    cands = []
+    try:
+        with open(os.path.join(ROOT, 'node.path'), encoding='utf-8-sig') as f:
+            cands.append(f.read().strip())
+    except Exception:
+        pass
+    pf = os.environ.get('ProgramFiles') or r'C:\Program Files'
+    la = os.environ.get('LOCALAPPDATA') or ''
+    cands.append(os.path.join(pf, 'nodejs', 'node.exe'))
+    if la:
+        cands.append(os.path.join(la, 'Programs', 'nodejs', 'node.exe'))
+    cands.append(shutil.which('node') or '')
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
 def _enc_key(plain):
     """用 keyvault.js 把明文 key 加密成 v1:... ；失败返回空串（调用方退回明文）"""
-    node = shutil.which('node') or 'node'
+    node = find_node() or 'node'
     try:
         p = subprocess.run([node, os.path.join(ROOT, 'keyvault.js'), 'enc'],
                            input=str(plain).encode('utf-8'),
@@ -358,7 +383,10 @@ def runner_alive():
 def start_runner(max_sec):
     if runner_alive():
         return {'ok': True, 'already': True, 'pid': RUNNER['proc'].pid}
-    node = shutil.which('node') or 'node'
+    node = find_node()
+    if not node:
+        return {'ok': False, 'err': '找不到 node.exe（PATH 里没有，node.path 也没有）。'
+                                    '双击 start-all.cmd 或 install.cmd 让它记下路径，再点开始'}
     os.makedirs(LOGD, exist_ok=True)   # logs 目录可能被删/移走，跑课进程的输出得先有地方落
     out = open(os.path.join(LOGD, 'runner.out'), 'ab')
     flags = 0x08000000 if os.name == 'nt' else 0
@@ -366,6 +394,8 @@ def start_runner(max_sec):
         p = subprocess.Popen([node, os.path.join(ROOT, 'run-all.js'), str(max_sec)],
                              cwd=ROOT, stdout=out, stderr=subprocess.STDOUT,
                              creationflags=flags)
+    except FileNotFoundError as ex:
+        return {'ok': False, 'err': '启动 run-all.js 失败：%s（node=%s）—— 跑一次 doctor.cmd 看环境' % (ex, node)}
     finally:
         out.close()
     RUNNER['proc'] = p
@@ -413,6 +443,7 @@ def api_state():
         pass
     st['stt'] = _MODEL is not None
     st['py'] = '%d.%d.%d' % sys.version_info[:3]
+    st['node'] = find_node() or ''      # 空串 = serve 这个进程找不到 node，点开始会失败
     st['fw'] = fw_ok()          # faster-whisper 装好了没
     st['model'] = model_state() # local / hub / none
     st['runner'] = runner_alive()
