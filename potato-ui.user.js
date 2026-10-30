@@ -461,7 +461,7 @@
     const on = e.target.checked;
     if (on) {
       if (!ensureFarm()) {
-        $('#p-farm-stat').textContent = '挂机脚本没加载，请确认油猴里装了 potato-farm';
+        $('#p-farm-stat').textContent = '挂机模块没注入：关掉 watch 窗口，用 potato-watch.cmd --farm 重开';
         e.target.checked = false;
         return;
       }
@@ -510,9 +510,9 @@
     let tip = '环境正常，可以开跑';
     if (!srv) tip = '本地服务没起来：回到项目文件夹双击 serve.cmd';
     else if (!srv.cdp) tip = 'CDP 没连上：用 start-chrome.cmd 开调试版浏览器';
-    else if (!farm) tip = '挂机模块没装：再装一个 potato-farm.user.js';
+    else if (!farm) tip = '挂机模块没注入：potato-watch.cmd --farm 重开（不用装油猴）';
     else if (!srv.stt) tip = '转写引擎待命：第一次答题会自动下载模型（约 140MB）';
-    $('#p-env-tip').innerHTML = tip.replace(/serve\.cmd|start-chrome\.cmd|potato-farm\.user\.js|faster-whisper/g, m => '<code>' + m + '</code>');
+    $('#p-env-tip').innerHTML = tip.replace(/serve\.cmd --farm|potato-watch\.cmd --farm|serve\.cmd|start-chrome\.cmd|potato-farm\.user\.js|faster-whisper/g, m => '<code>' + m + '</code>');
   }
 
   $('#p-env-srv').onclick = envCheck;

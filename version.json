@@ -1,5 +1,5 @@
 {
-  "build": 2026103003,
-  "name": "v1.1.2",
-  "note": "新增改错题（question-revise-mistake）自动作答；POTATO_NO_SUBMIT/POTATO_CORRECT_PLAN 调试开关"
+  "build": 2026103004,
+  "name": "v1.1.3",
+  "note": "面板/文档不再提示装油猴（挂机用 potato-watch.cmd --farm）；BROWSER.md 更新配置目录与配音硬伤说明"
 }
