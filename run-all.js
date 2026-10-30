@@ -343,7 +343,13 @@ function solveBlank(stmt, passage) {
   // getUserMedia（实测第 2 句起 0 次调用；刷新页面立刻恢复）。所以每句之前刷一次页面。
   async function reloadForVoice() {
     await c.call('Page.reload', { ignoreCache: false });
-    await sleep(6000);
+    await sleep(5000);
+    // 等到页面渲染出内容（pager 或任何一个题型元素出现）再返回，光 sleep 不够稳
+    for (let t = 0; t < 12; t++) {
+      const ready = await ev('(function(){return (document.querySelector(".question-common-course-page")||document.querySelector(".sentence-container")||document.querySelector(".scoop-input-wrapper")||document.querySelector(".option"))?1:0})()');
+      if (Number(ready) === 1) break;
+      await sleep(800);
+    }
     await closeDlg();
     await sleep(800);
   }
@@ -682,6 +688,36 @@ function solveBlank(stmt, passage) {
     if (!n) return;
     log('    跟读 ' + n + ' 题（每句前刷一次页面：这屏的录音组件只肯要一次麦克风）');
 
+    // 带分页的屏（第1页填空 / 第2页跟读）刷新会回到第 1 页，必须点回跟读页再录。
+    // 判断"回到了对的那页"用第一句文本当签名，比数页面更抗改版。
+    // 签名要去掉行首那个分数（录完会从 0 变成 96，不然"回不到跟读页"会误报）
+    const firstSentence = async () => await ev('(function(){var s=document.querySelectorAll(".sentence-container")[0];' +
+      'if(!s)return "";' +
+      'var t=String(s.textContent||"").replace(/\s+/g," ").trim();' +
+      't=t.replace(/^\d+(\.\d+)?\s*/,"");' +
+      'return t.slice(0,40)})()');
+
+    const clickPager = async (label) => {
+      const r = JSON.parse(await ev('(function(){var els=[].slice.call(document.querySelectorAll("a,button,div[role=button]"));' +
+        'var el=els.filter(function(e){return String(e.textContent||"").replace(/\s+/g,"")===' + JSON.stringify(label) + '})[0];' +
+        'if(!el)return JSON.stringify({err:"no-btn"});' +
+        'el.scrollIntoView({block:"center"});var b=el.getBoundingClientRect();' +
+        'return JSON.stringify({x:Math.round(b.left+b.width/2),y:Math.round(b.top+b.height/2)})})()') || '{}');
+      if (!r.x) return false;
+      await click(r.x, r.y);
+      await sleep(1600);
+      return true;
+    };
+
+    const restoreVoicePage = async (sig) => {
+      for (let k = 0; k < 10; k++) {
+        if (String(await firstSentence()) === sig) return true;
+        if (await clickPager('下一题')) { await sleep(1200); continue; }
+        await sleep(1500);   // 还没渲染完，等会儿再找按钮
+      }
+      return String(await firstSentence()) === sig;
+    };
+
     const micRect = i => '(function(){' +
       'var s=document.querySelectorAll(".sentence-container")[' + i + '];' +
       'if(!s)return JSON.stringify({err:"no-row"});' +
@@ -707,9 +743,16 @@ function solveBlank(stmt, passage) {
       const beforeN = await ev('window.__voiceProbe.n');
       await click(rect.x, rect.y);
       let started = false;
+      let confirmed = false;
       for (let t = 0; t < 16; t++) {
         await sleep(250);
         if (Number(await ev('window.__voiceProbe.n')) > Number(beforeN)) { started = true; break; }
+        // 这一句以前录过 → 页面会先弹「确定重新录制吗？」，点确定才真的开始
+        if (!confirmed) {
+          const clicked = await ev('(function(){var bs=[].slice.call(document.querySelectorAll(".ant-modal button,.ant-popover button,.ant-modal-confirm button"))' +
+            '.filter(function(b){return /确定|确 定/.test(String(b.textContent||""))&&!b.disabled});if(!bs.length)return 0;bs[bs.length-1].click();return 1})()');
+          if (clicked) { confirmed = true; log('      （这一句以前录过，点了「确定」重录）'); }
+        }
       }
       if (!started) {
         rect = JSON.parse(await ev(micRect(i)) || '{}');
@@ -741,11 +784,15 @@ function solveBlank(stmt, passage) {
       return scored;
     };
 
+    const pageSig = String(await firstSentence());
     let ok = 0;
     const failed = [];
     for (let i = 0; i < n; i++) {
       // 第一句用当前页面，之后每句刷一次（见 reloadForVoice 的注释）
-      if (i > 0) await reloadForVoice();
+      if (i > 0) {
+        await reloadForVoice();
+        if (!(await restoreVoicePage(pageSig))) { log('      第' + (i + 1) + '句 刷新后回不到跟读页（第一句对不上），跳过'); failed.push(i); continue; }
+      }
       if (await recordOne(i)) ok++; else failed.push(i);
     }
     // 没成的再刷一遍重试一次（有的行第一轮录不上，第二轮能上）
@@ -753,9 +800,12 @@ function solveBlank(stmt, passage) {
       log('    重试 ' + failed.length + ' 句：' + failed.map(i => i + 1).join(','));
       for (const i of failed.slice()) {
         await reloadForVoice();
+        if (!(await restoreVoicePage(pageSig))) continue;
         if (await recordOne(i)) { ok++; failed.splice(failed.indexOf(i), 1); }
       }
     }
+    // 收尾：确定人还在跟读页（刷新/重试之后可能被甩回第 1 页，提交就会提错页）
+    if (!(await restoreVoicePage(pageSig))) log('    !! 收尾时回不到跟读页（下一句翻页可能失败）');
     log('    跟读完成 ' + ok + '/' + n + ' 句有分' + (failed.length ? '（没分：第 ' + failed.map(i => i + 1).join(',') + ' 句）' : ''));
   }
 
