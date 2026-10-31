@@ -39,6 +39,9 @@
   .dot.run{background:var(--ok);box-shadow:0 0 8px var(--ok)}
   .dot.stop{background:var(--err)}
   .dot.pause{background:var(--warn)}
+  .ok{color:var(--ok)}
+  .err{color:var(--err)}
+  .warn{color:var(--warn)}
   .full{grid-column:1/-1}
 </style>
 </head>
@@ -85,6 +88,7 @@
       <label>CDP (9222) <span id="chkCdp" class="dim">–</span></label>
       <label>本地服务 (8787) <span id="chkSrv" class="dim">–</span></label>
       <label>Whisper 模型 <span id="chkStt" class="dim">–</span></label>
+      <label>跑课进程 <span id="chkRunner" class="dim">–</span></label>
       <label>当前页面 <span id="chkPage" class="dim" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">–</span></label>
       <label>模型用量 <span id="chkUsage" class="dim">–</span></label>
       <div style="display:flex;gap:8px;margin-top:10px">
@@ -137,13 +141,20 @@ function render(st){
       : '还没用过';
   }
   const dot = $('#dot'); dot.className = 'dot ' + (s==='running'?'run':s==='paused'?'pause':'stop');
-  $('#stateText').textContent = {running:'运行中',paused:'已暂停',stopped:'已停止'}[s] || s;
+  let stTxt = {running:'运行中',paused:'已暂停',stopped:'已停止'}[s] || s;
+  // 状态字段说在跑、进程却没了（杀毒/手动任务管理器/崩溃）—— 直接说清楚，别让人对着「运行中」干等
+  if (!st.runner && (s === 'running')) stTxt = '运行中（但进程已经没了，点开始重起）';
+  $('#stateText').textContent = stTxt;
   $('#curSec').textContent = st.section || '-';
   $('#curScreen').textContent = st.screen || '-';
   $('#okCount').textContent = st.ok || 0;
   $('#failCount').textContent = st.fail || 0;
-  $('#btnStart').disabled = s === 'running';
+  $('#btnStart').disabled = s === 'running' || st.runner === true;
   $('#btnPause').disabled = s !== 'running';
+  if ($('#chkRunner')) {
+    $('#chkRunner').textContent = st.runner ? ('在跑 pid ' + (st.runnerPid || '?')) : '没在跑';
+    $('#chkRunner').className = st.runner ? 'ok' : 'dim';
+  }
   $('#chkCdp').textContent = st.cdp ? '正常' : '未连上';
   $('#chkCdp').className = st.cdp ? 'ok' : 'err';
   $('#chkSrv').textContent = st.srv ? '正常' : '未连上';
@@ -182,15 +193,48 @@ async function tick(){
   }
 }
 
+function note(text, cls){
+  pushLog([{ text: '[' + new Date().toLocaleTimeString() + '] ' + text, cls: cls || 'dim' }]);
+}
+
+// 点了停止之后要能看见结果：老版本只发一个 POST 就完事，
+// 进程要是没退（孤儿/dub.js 卡住），界面照样回到「运行中」，用户以为按钮坏了。
+async function waitStopped(ms){
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    const st = await jget('/api/state');
+    if (st && !st.runner) return st;
+    await new Promise(r => setTimeout(r, 600));
+  }
+  return await jget('/api/state');
+}
+
 $('#btnStart').onclick = async () => {
+  $('#btnStart').disabled = true;
   const r = await jpost('/api/run', { action:'start', maxSec: Number($('#maxSec').value)||8, delay: Number($('#delay').value)||900, rate: Number($('#rate').value)||4, guess: $('#guess').checked, filler: $('#filler').checked, apiKey: $('#apiKey').value });
   $('#apiKey').value = '';
-  if (r && r.ok) console.log(r.already ? '已在跑 pid=' + r.pid : '已启动 pid=' + r.pid);
-  else alert('启动失败：' + ((r && r.err) || '连不上本地服务 8787'));
+  if (r && r.ok) note(r.already ? '这个进程已经在跑了（pid ' + r.pid + '），没有重复启动' : '已启动 pid ' + r.pid, 'ok');
+  else note('启动失败：' + ((r && r.err) || '连不上本地服务 8787'), 'err');
+  await tick();
+};
+$('#btnPause').onclick = async () => {
+  const r = await jpost('/api/control',{action:'pause'});
+  note(r && r.ok ? '已请求暂停（正在做的这一小步做完就停）' : '暂停失败：连不上 8787', r && r.ok ? 'warn' : 'err');
   tick();
 };
-$('#btnPause').onclick = async () => { await jpost('/api/control',{action:'pause'}); tick(); };
-$('#btnStop').onclick = async () => { await jpost('/api/run',{action:'stop'}); tick(); };
+$('#btnStop').onclick = async () => {
+  $('#btnStop').disabled = true;
+  const r = await jpost('/api/run',{action:'stop'});
+  if (!r) note('停止失败：连不上本地服务 8787', 'err');
+  else if (r.already) note('本来就没在跑', 'dim');
+  else {
+    const st = await waitStopped(8000);
+    if (st && !st.runner) note(r.graceful ? '已停止（进程自己退的）' : '已停止（进程没响应，已强杀 pid ' + r.pid + '）', 'ok');
+    else note('进程还没退（pid ' + r.pid + '）：在跑 dub.js 转写时可能要多等几秒，还不行就双击 stop-all.cmd', 'warn');
+  }
+  $('#btnStop').disabled = false;
+  tick();
+};
 
 tick();
 setInterval(tick, 2000);

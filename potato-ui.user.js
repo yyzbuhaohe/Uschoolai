@@ -348,7 +348,9 @@
     ball.className = 'p-ui ' + s;
     $('#p-sec').textContent = st.section || '-';
     $('#p-screen').textContent = (st.screen || '-').slice(0, 14);
-    $('#p-go').disabled = s === 'running';
+    // 进程真的在跑就禁掉开始：老版本只看 state 字段，
+    // 状态卡在 running 而进程早死了的时候，点开始什么也不会发生（也看不到原因）。
+    $('#p-go').disabled = s === 'running' || st.runner === true;
     $('#p-pause').disabled = s !== 'running';
 
     // 进度条
@@ -448,7 +450,10 @@
   $('#p-pause').onclick = async () => { await post({ action: 'pause' }); logLine('已暂停'); tick(); };
   $('#p-stop').onclick = async () => {
     const r = await postRun({ action: 'stop' });
-    logLine('已停止' + (r && r.pid ? '（pid ' + r.pid + '）' : ''));
+    if (!r) logLine('停止失败：连不上本地服务 8787', 'err');
+    else if (r.already) logLine('本来就没在跑');
+    else if (r.graceful) logLine('已停止（pid ' + r.pid + ' 自己退的）', 'ok');
+    else logLine('已强杀 pid ' + r.pid + '（' + (r.killed ? 'taskkill /T' : '看进程还在不在') + '）', 'warn');
     tick();
   };
 

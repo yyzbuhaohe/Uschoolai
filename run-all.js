@@ -19,18 +19,79 @@ const readCtrl = () => {
   try { return JSON.parse(fs.readFileSync(CTRL_PATH, 'utf8').replace(/^\uFEFF/, '')); }
   catch (e) { return { state: 'running' }; }
 };
-async function guard() {
-  for (;;) {
-    const c = readCtrl();
-    if (c.state === 'stop') { log('!! 外部停止'); saveState(); process.exit(0); }
-    if (c.state !== 'paused') return c;
-    STATE.state = 'paused'; saveState();
-    await sleep(1500);
-  }
+const PID_PATH = path.join(ROOT, 'runner.pid');
+// ---- 停止 / 暂停 ----------------------------------------------------------
+// 老版本两个坑：
+//   1) 这里比的是 c.state === 'stop'，但 serve.py 停的时候写的是 'stopped' —— 软停从来没生效过，
+//      「停止」按钮只能靠外部硬杀进程；杀掉之后 run-all.js 里的状态还停在 running。
+//   2) 只在每节 / 每屏开头检查一次控制文件。跟读一屏要刷十几次页面、说话要等 TTS，
+//      点「暂停 / 停止」后最长要几分钟才响应。
+// 现在：serve.py 停止时写 control.json.state = "stop"（以前写 "stopped"，runner 认不出来），
+// 并且把检查塞进 sleep() —— 全流程随便哪一步都能被立刻打断。
+const rawSleep = ms => new Promise(r => setTimeout(r, ms));
+let _lastCk = 0;
+function CtrlHalt() {
+  const s = String(readCtrl().state || '');
+  // 只认「停止命令」这两个词。'stopped' 是静止态（serve 没跑课时的值），
+  // 要是把它也当停止命令，手动跑 `node run-all.js 1 --here` 会被当场劝退。
+  if (s === 'stop' || s === 'stopping') return 'stop';
+  if (s === 'paused') return 'paused';
+  return 'running';
 }
+async function checkpoint(force) {
+  const now = Date.now();
+  if (!force && now - _lastCk < 1200) return 'running';
+  _lastCk = now;
+  let halt = CtrlHalt();
+  if (halt === 'stop') {
+    log('!! 外部停止（控制台点了停止，control.json = stop）');
+    try { flushUsage(); } catch (e) {}
+    STATE.state = 'stopped'; saveState();
+    clearPid();
+    process.exit(0);
+  }
+  while (halt === 'paused') {
+    if (STATE.state !== 'paused') { STATE.state = 'paused'; saveState(); log('   已暂停（控制台点「开始」继续）'); }
+    await rawSleep(800);
+    halt = CtrlHalt();
+    if (halt === 'stop') {
+      log('!! 暂停中收到停止');
+      try { flushUsage(); } catch (e) {}
+      STATE.state = 'stopped'; saveState();
+      clearPid();
+      process.exit(0);
+    }
+  }
+  if (STATE.state === 'paused') { STATE.state = 'running'; saveState(); log('   继续跑'); }
+  return 'running';
+}
+function pidAlive(pid) {
+  if (!pid || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+function writePid() {
+  try {
+    const old = Number(String(fs.readFileSync(PID_PATH, 'utf8') || '').trim() || 0);
+    if (old && old !== process.pid && pidAlive(old)) {
+      log('!! 已经有一个 run-all.js 在跑（pid ' + old + '）：两个进程同时点页面会互相踩，先去控制台点停止');
+    }
+  } catch (e) {}
+  try { fs.writeFileSync(PID_PATH, String(process.pid), 'utf8'); } catch (e) {}
+}
+function clearPid() {
+  // 只删自己的：别把后起的那个 runner 的 pid 也删了
+  try {
+    const cur = String(fs.readFileSync(PID_PATH, 'utf8') || '').trim();
+    if (!cur || cur === String(process.pid)) fs.unlinkSync(PID_PATH);
+  } catch (e) {}
+}
+async function guard() { await checkpoint(true); return readCtrl(); }
 const LOG = path.join(ROOT, 'run-all.log');
 const log = (m) => { const s = '[' + new Date().toLocaleTimeString() + '] ' + m; console.log(s); try { fs.appendFileSync(LOG, s + '\n'); } catch (e) {} };
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+// 所有 sleep 都顺手过一遍控制文件（最多 1.2 秒一次），
+// 这样点暂停/停止不用等到下一个「节」或「屏」才响应
+const sleep = async (ms) => { if (ms > 200) await checkpoint(false); return rawSleep(ms); };
 
 async function page(){const ts=await (await fetch(BASE+'/json/list')).json();const ps=ts.filter(t=>t.type==='page'&&t.webSocketDebuggerUrl);return ps.find(p=>/ucontent/.test(p.url))||ps[0];}
 function connect(u){return new Promise((res,rej)=>{const ws=new WebSocket(u);let seq=0;const w=new Map();ws.onmessage=e=>{let m;try{m=JSON.parse(e.data);}catch(x){return;}if(m.id&&w.has(m.id)){const h=w.get(m.id);w.delete(m.id);m.error?h.rej(new Error(JSON.stringify(m.error))):h.res(m.result);}};ws.onopen=()=>res({call:(mm,pp)=>new Promise((a,b)=>{const id=++seq;w.set(id,{res:a,rej:b});ws.send(JSON.stringify({id,method:mm,params:pp||{}}));}),close:()=>{try{ws.close();}catch(x){}}});ws.onerror=()=>rej(new Error('ws'));});}
@@ -49,17 +110,46 @@ function flushUsage() {
 }
 setInterval(flushUsage, 5000);
 process.on('exit', flushUsage);
+process.on('exit', clearPid);
 
+// 问模型：带超时 + 重试。
+// 老版本一次 fetch 失败（网络抖、500、超时）会直接把异常抛到顶层，整轮跑课当场退出；
+// 而且没有超时，DeepSeek 挂住的时候进程就一直吊在那儿，控制台还显示「运行中」。
 async function ask(p, s) {
-  const r = await fetch('https://api.deepseek.com/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + KEY }, body: JSON.stringify({ model: 'deepseek-chat', temperature: 0, messages: [{ role: 'system', content: s }, { role: 'user', content: p }] }) });
-  const j = await r.json();
-  if (j.usage) {
-    USAGE.calls += 1;
-    USAGE.in += +j.usage.prompt_tokens || 0;
-    USAGE.out += +j.usage.completion_tokens || 0;
-    usageDirty = true;
+  const body = JSON.stringify({ model: 'deepseek-chat', temperature: 0, messages: [{ role: 'system', content: s }, { role: 'user', content: p }] });
+  let lastErr = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await fetch('https://api.deepseek.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer ' + KEY },
+        body,
+        signal: AbortSignal.timeout(120000)
+      });
+      if (!r.ok) {
+        lastErr = 'HTTP ' + r.status;
+        if (r.status === 401 || r.status === 403) { log('   !! Key 被拒（' + r.status + '）：面板里重填一次'); break; }
+        if (r.status === 402) { log('   !! 余额不足（402）：充值后再跑'); break; }
+        await sleep(1200 * attempt);
+        continue;
+      }
+      const j = await r.json();
+      if (j.usage) {
+        USAGE.calls += 1;
+        USAGE.in += +j.usage.prompt_tokens || 0;
+        USAGE.out += +j.usage.completion_tokens || 0;
+        usageDirty = true;
+      }
+      const txt = ((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '').trim();
+      if (!txt) { lastErr = '空回复'; await sleep(1000 * attempt); continue; }
+      return txt;
+    } catch (e) {
+      lastErr = (e && e.message) || String(e);
+      if (attempt < 3) { log('   [warn] 模型调用第 ' + attempt + ' 次失败（' + lastErr.slice(0, 60) + '），重试'); await sleep(1500 * attempt); }
+    }
   }
-  return ((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '').trim();
+  log('   !! 模型调用失败：' + lastErr.slice(0, 120));
+  return '';
 }
 
 // ---- 启动自检：新人最常见的三件事（Node 太旧 / 浏览器没开调试端口 / 服务没起）在这里一次说清，
@@ -115,6 +205,11 @@ async function preflight() {
   const COMMENT_TEXT = _c0.commentText || 'I think this unit is interesting and useful.';
   const MAX_FAIL = Number(_c0.maxFail || 5);
   const PAUSE_EVERY = Number(_c0.pauseEvery || 0);
+  // 控制台/面板上的这三个开关以前是纯摆设：run-all.js 从来没读过 guess / filler / delay。
+  const GUESS_IMG = _c0.guess !== false;                                       // 图片题随机蒙
+  const USE_FILLER = _c0.filler !== false;                                     // 主观题写通用文案
+  const ANSWER_DELAY = Math.min(5000, Math.max(0, Number(_c0.delay || 0)));    // 填完到提交之间的停顿
+  let LAST_ANSWERS = [];   // 最近一次选择题答案，提交前体检拿来补漏（下标与 pickByIndex 一致）
   // Key 可能是加密的（apiKeyEnc），也可能是旧版明文（apiKey）或环境变量
   let cfgKey = '';
   if (_c0.apiKeyEnc) {
@@ -127,9 +222,15 @@ async function preflight() {
     log('!! 没配 DeepSeek API Key —— 获取方法见 docs/API-KEY.md，填到土豆面板的「模型」框，或写进 control.json 的 apiKey');
     process.exit(1);
   }
-  if (await preflight()) process.exit(2);
+  if (await preflight()) { clearPid(); process.exit(2); }
+  writePid();   // serve.py 靠这个 pid 才能杀掉「控制台重启后变成孤儿」的 runner
   const c = await connect((await page()).webSocketDebuggerUrl);
-  const ev = async e => { const r = await c.call('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true }); if (r && r.exceptionDetails) return 'EXC'; return r && r.result ? r.result.value : undefined; };
+  const ev = async e => { const r = await c.call('Runtime.evaluate', { expression: e, returnByValue: true, awaitPromise: true }); if (r && r.exceptionDetails) return ''; return r && r.result ? r.result.value : undefined; };
+  // ※ ev 失败时返回空串（原来是 'EXC'）。全文件有十几处 `JSON.parse(await ev(expr) || '[]')`，
+  //   一旦表达式在页面里抛异常，JSON.parse('EXC') 会把整个 run-all.js 带走 —— 崩在子进程里，
+  //   控制台只看到「运行中」而日志一片空白。给空串，`|| '[]'` 这个默认值才真的能兜住。
+  // 统一走 jev：解析不了就给默认值，题型识别降级，不崩。
+  const jev = async (expr, dflt) => { const v = await ev(expr); if (v === 'EXC' || v === undefined || v === null) return dflt; try { return JSON.parse(v); } catch (e) { return dflt; } };
   const unblock = async () => {
     const blocked = await ev("(function(){var e=document.elementFromPoint(700,400);return !!(e&&/ant-modal-wrap/.test(String(e.className||'')))})()");
     if (blocked) {
@@ -205,7 +306,8 @@ function solveBlank(stmt, passage) {
   const type = t => c.call('Input.insertText', { text: t });
   const btn = async ws => { const v = await ev("(function(){var ws=" + JSON.stringify(ws) + ";var h=null;document.querySelectorAll('a,button,.ant-btn,div[role=button]').forEach(function(b){if(b.offsetParent===null)return;var t=String(b.textContent||'').replace(/\\s+/g,'');if(ws.indexOf(t)<0)return;var r=b.getBoundingClientRect();if(r.width<4)return;h={el:b,t:t}});if(h&&h.el){h.el.scrollIntoView({block:'center'});var rr=h.el.getBoundingClientRect();h={x:Math.round(rr.left+rr.width/2),y:Math.round(rr.top+rr.height/2),t:h.t}}return JSON.stringify(h)})()"); return v && v !== 'null' ? JSON.parse(v) : null; };
   const closeDlg = async () => { const d = await btn(['我知道了']); if (d) { await click(d.x, d.y); await sleep(800); return true; } return false; };
-  const kind = async () => JSON.parse(await ev("JSON.stringify({ins:[].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input,input.input-user-answer')).filter(function(e){return e.offsetParent!==null}).length,opt:document.querySelectorAll('.option').length,ta:[].slice.call(document.querySelectorAll('textarea')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>60&&r.height>20}).length,dd:[].slice.call(document.querySelectorAll('.ant-dropdown-trigger.user-answer')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();if(r.width<10||r.height<4)return false;if(r.top<0||r.bottom>window.innerHeight)return false;var box=e.closest('.question-common-abs-reply,.question,.answers-list,.layoutBody-container');if(!box)return false;var br=box.getBoundingClientRect();return br.width>50&&br.height>20}).length,qa:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;if(/评论/.test(t.placeholder||''))return false;if(t.closest('[class*=discussion]'))return false;var r=t.getBoundingClientRect();return r.width>60&&r.height>20}).length,cmt:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;var r=t.getBoundingClientRect();if(r.width<60||r.height<20)return false;return /评论/.test(t.placeholder||'')||!!t.closest('[class*=discussion]')}).length,up:(document.querySelector('.question-multi-file-upload')?1:0),sort:document.querySelectorAll('[class*=sequence-reply-view-item]').length,img:[].slice.call(document.querySelectorAll('.option img,.option-placeholder img')).filter(function(e){var o=e.closest('.option,.option-placeholder');if(!o||o.offsetParent===null)return false;var r=o.getBoundingClientRect();return r.width>4&&r.height>4}).length,sent:[].slice.call(document.querySelectorAll('.sentence-container')).filter(function(s){return !!s.querySelector('audio')}).length,sentAll:document.querySelectorAll('.sentence-container').length,rec:document.querySelectorAll('.record-icon.button-record').length,rev:document.querySelectorAll('.question-revise-mistake').length})") || '{}');
+  const EMPTY_KIND = { ins: 0, opt: 0, ta: 0, dd: 0, qa: 0, cmt: 0, up: 0, sort: 0, img: 0, sent: 0, sentAll: 0, rec: 0, rev: 0 };
+  const kind = async () => await jev("JSON.stringify({ins:[].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input,input.input-user-answer')).filter(function(e){return e.offsetParent!==null}).length,opt:document.querySelectorAll('.option').length,ta:[].slice.call(document.querySelectorAll('textarea')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>60&&r.height>20}).length,dd:[].slice.call(document.querySelectorAll('.ant-dropdown-trigger.user-answer')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();if(r.width<10||r.height<4)return false;if(r.top<0||r.bottom>window.innerHeight)return false;var box=e.closest('.question-common-abs-reply,.question,.answers-list,.layoutBody-container');if(!box)return false;var br=box.getBoundingClientRect();return br.width>50&&br.height>20}).length,qa:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;if(/评论/.test(t.placeholder||''))return false;if(t.closest('[class*=discussion]'))return false;var r=t.getBoundingClientRect();return r.width>60&&r.height>20}).length,cmt:[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;var r=t.getBoundingClientRect();if(r.width<60||r.height<20)return false;return /评论/.test(t.placeholder||'')||!!t.closest('[class*=discussion]')}).length,up:(document.querySelector('.question-multi-file-upload')?1:0),sort:document.querySelectorAll('[class*=sequence-reply-view-item]').length,img:[].slice.call(document.querySelectorAll('.option img,.option-placeholder img')).filter(function(e){var o=e.closest('.option,.option-placeholder');if(!o||o.offsetParent===null)return false;var r=o.getBoundingClientRect();return r.width>4&&r.height>4}).length,sent:[].slice.call(document.querySelectorAll('.sentence-container')).filter(function(s){return !!s.querySelector('audio')}).length,sentAll:document.querySelectorAll('.sentence-container').length,rec:document.querySelectorAll('.record-icon.button-record').length,rev:document.querySelectorAll('.question-revise-mistake').length})", EMPTY_KIND);
   const waitKind = async (maxMs = 8000) => {
     const t0 = Date.now();
     let last = null;
@@ -222,7 +324,15 @@ function solveBlank(stmt, passage) {
     return await kind();
   };
   const summary = async () => ev("(function(){var t=String(document.body.innerText||'');return t.indexOf('答题小结')>=0})()");
-  const score = async () => ev("(function(){var t=String(document.body.innerText||'').replace(/\\s+/g,' ');var m=t.match(/(\\d+(\\.\\d+)?)\\s*分/);return m?m[1]:'?'})()");
+  // 抓分：老写法是「整页 innerText 里第一个 N 分」，页头/历史记录里随便一个数字就把成败判错了，
+  // 连续误判还会触发「连续 N 屏没分 → 自动暂停」。现在优先认分数节点，其次认答题小结。
+  const score = async () => ev("(function(){" +
+    "var num=function(s){var m=String(s||'').match(/([0-9]+(?:\\.[0-9]+)?)\\s*分/);return m?m[1]:null};" +
+    "var cand=[].slice.call(document.querySelectorAll('[class*=score],[class*=Score],[class*=result],[class*=Result],[class*=grade]')).filter(function(e){return e.offsetParent!==null});" +
+    "for(var i=0;i<cand.length;i++){var v=num(cand[i].textContent);if(v)return v}" +
+    "var t=String(document.body.innerText||'').replace(/\\s+/g,' ');var k=t.indexOf('答题小结');" +
+    "if(k>=0){var v2=num(t.slice(k,k+80));if(v2)return v2}" +
+    "var m=t.match(/([0-9]+(?:\\.[0-9]+)?)\\s*分/);return m?m[1]:'?'})()");
 
   // ---- 各题型处理 ----
   // 按“第几题 + 字母”定位并点击，滚动到位，点完验证，失败重试
@@ -252,25 +362,110 @@ function solveBlank(stmt, passage) {
     }
     return 'fail';
   };
-  // 提交前自检：把没选的题补上（用模型给的答案）
-  const selfCheck = async (wantMap) => {
-    const miss = JSON.parse(await ev("(function(){" +
-      "var qs=[].slice.call(document.querySelectorAll('.question-common-abs-reply,.question-basic'));" +
-      "var o=[];" +
-      "qs.forEach(function(q,i){if(!q.querySelector('.option'))return;if(q.querySelector('.option.selected'))return;o.push(i)});" +
-      "return JSON.stringify(o)" +
-    "})()") || '[]');
-    if (!miss.length) return 0;
-    log('    自检：第 ' + miss.map(i => i + 1).join(',') + ' 题未选，补答');
-    let fixed = 0;
-    for (const i of miss) {
-      const letter = (wantMap && wantMap[i]) || 'A';
-      const r = await pickByIndex(i, letter);
-      if (r === 'ok') fixed++;
-      log('      第' + (i + 1) + '题 → ' + letter + ' ' + r);
-    }
-    return fixed;
+  // ---- 提交前体检（v1.1.8）---------------------------------------------------
+  // 老 selfCheck 有两个毛病：
+  //   1) 只补选择题（.option.selected），填空/下拉/主观题空了照样提交，等于交白卷；
+  //   2) 它枚举 .question-common-abs-reply,.question-basic 时**没有**过滤「<2 个选项」和
+  //      「Directions 块」，而 pickByIndex 用的是 QS_JS 那套过滤后的下标。
+  //      一屏里只要多一个 Directions 块或一道单选项题，补答就会点到别的题上。
+  // 现在统一用 pickByIndex 同一套过滤规则，并且一次查五类：
+  //   选择 / 填空 / 下拉 / 文本 / （排序只看条数，不动手）。
+  const AUDIT_JS = "(function(){" +
+    "var vis=function(e){if(!e)return false;if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0};" +
+    "var qs=[].slice.call(document.querySelectorAll('.question-common-abs-reply,.question-basic')).filter(function(q){if(q.querySelectorAll('.option').length<2)return false;if(/^Directions/i.test(String(q.textContent||'').trim()))return false;return true});" +
+    "var noPick=[];qs.forEach(function(q,i){if(!q.querySelector('.option.selected'))noPick.push(i)});" +
+    "var ins=[].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input,input.input-user-answer')).filter(vis);" +
+    "var noFill=[];ins.forEach(function(e,i){if(!String(e.value||'').trim())noFill.push(i)});" +
+    "var dd=[].slice.call(document.querySelectorAll('.ant-dropdown-trigger.user-answer')).filter(vis);" +
+    "var noDd=[];dd.forEach(function(e,i){var t=String(e.textContent||'').trim();if(!t||/点击选择|请选择|^\\s*[-—]+\\s*$/.test(t))noDd.push(i)});" +
+    "var tas=[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(!vis(t))return false;if(t.closest('.scoop-input-wrapper'))return false;var r=t.getBoundingClientRect();return r.width>60&&r.height>20});" +
+    "var noText=[];tas.forEach(function(t,i){if(!String(t.value||'').trim())noText.push(i)});" +
+    "var sort=document.querySelectorAll('[class*=sequence-reply-view-item]').length;" +
+    "return JSON.stringify({qs:qs.length,noPick:noPick,ins:ins.length,noFill:noFill,dd:dd.length,noDd:noDd,ta:tas.length,noText:noText,sort:sort})" +
+  "})()";
+  const EMPTY_AUDIT = { qs: 0, noPick: [], ins: 0, noFill: [], dd: 0, noDd: [], ta: 0, noText: [], sort: 0 };
+  const auditState = async () => await jev(AUDIT_JS, null);
+
+  // 下拉最后手段：点开触发器，选第一个能点的选项（宁可错一个字母，也别交一个空）
+  const forceDropdown = async (idx) => {
+    const t = await jev("(function(){var dd=[].slice.call(document.querySelectorAll('.ant-dropdown-trigger.user-answer')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0});var e=dd[" + idx + "];if(!e)return 'null';e.scrollIntoView({block:'center'});var r=e.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()", null);
+    if (!t) return false;
+    await click(t.x, t.y);
+    await sleep(900);
+    const o = await jev("(function(){var cand=[];document.querySelectorAll('.ant-dropdown li,.ant-dropdown-menu li,.ant-select-item,li.select-option,.ant-dropdown a').forEach(function(e){var r=e.getBoundingClientRect();if(r.width<4||r.height<4)return;var tx=String(e.textContent||'').trim();if(!tx||tx.length>80)return;cand.push({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})});return JSON.stringify(cand[0]||null)})()", null);
+    if (!o) return false;
+    await click(o.x, o.y);
+    await sleep(600);
+    return true;
   };
+
+  // 返回 { ok, fixed, left, detail }
+  const preSubmitAudit = async (wantMap, opts) => {
+    const o = opts || {};
+    let total = 0, detail = [];
+    for (let round = 0; round < 2; round++) {
+      const a = await auditState();
+      if (!a) {
+        // 只有两种情况：页面结构大改（选择器全失效）或者 evaluate 被拦。
+        // 这时候绝不能报「体检通过」—— 那比不体检更坑。
+        log('    [warn] 体检脚本没跑起来（页面结构变了？），本轮跳过体检');
+        return { ok: true, fixed: 0, left: 0, unknown: true, detail };
+      }
+      const bad = a.noPick.length + a.noFill.length + a.noDd.length + a.noText.length;
+      total = bad;
+      const tag = round === 0 ? '体检' : '复查';
+      if (!bad) {
+        if (round === 0) log('    ' + tag + '通过：选择 ' + a.qs + ' 题 / 填空 ' + a.ins + ' 空 / 下拉 ' + a.dd + ' 题 / 文本 ' + a.ta + ' 框，全部有内容' + (a.sort ? '（排序 ' + a.sort + ' 条）' : ''));
+        return { ok: true, fixed: detail.length, left: 0, detail };
+      }
+      const bits = [];
+      if (a.noPick.length) bits.push('选择 第' + a.noPick.map(i => i + 1).join(',') + ' 题');
+      if (a.noFill.length) bits.push('填空 ' + a.noFill.length + '/' + a.ins + ' 空');
+      if (a.noDd.length) bits.push('下拉 ' + a.noDd.length + '/' + a.dd + ' 题');
+      if (a.noText.length) bits.push('文本 ' + a.noText.length + '/' + a.ta + ' 框');
+      log('    ' + tag + '：' + bits.join('；') + ' 未作答 → 补');
+      detail.push(bits.join('；'));
+
+      // 1) 选择题：用模型给的答案补，没有就 A
+      for (const qi of a.noPick) {
+        const letter = (wantMap && wantMap[qi]) || 'A';
+        const r = await pickByIndex(qi, letter);
+        log('      选择 第' + (qi + 1) + ' 题 → ' + letter + ' ' + r);
+      }
+      // 2) 填空：先让 doFill 重新算一遍（它会把整屏的空重填，幂等）；
+      //    还空着就直接写占位词，至少别交空壳
+      if (a.noFill.length) {
+        try { await doFill({}); } catch (e) { log('      填空重算异常 ' + e.message); }
+        const a2 = await auditState();
+        if (a2 && a2.noFill.length) {
+          await ev("(function(){" +
+            "var ins=[].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input,input.input-user-answer')).filter(function(e){if(e.offsetParent===null)return false;var r=e.getBoundingClientRect();return r.width>0&&r.height>0});" +
+            "var set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;" +
+            "var n=0;ins.forEach(function(e){if(String(e.value||'').trim())return;set.call(e," + JSON.stringify(o.placeholder || 'the') + ");e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));n++});return n})()");
+          await sleep(400);
+          log('      填空仍空的 ' + a2.noFill.length + ' 个，已写占位词');
+        }
+      }
+      // 3) 下拉：点开选第一个选项
+      for (const di of a.noDd) {
+        const okd = await forceDropdown(di);
+        log('      下拉 第' + (di + 1) + ' 题 ' + (okd ? '已选第一项' : '点不开'));
+      }
+      // 4) 主观题 / 评论框：写通用文案
+      if (a.noText.length) {
+        await ev("(function(){var T=" + JSON.stringify(o.text || FILLER_TEXT) + ";var ts=[].slice.call(document.querySelectorAll('textarea')).filter(function(t){if(t.offsetParent===null)return false;if(t.closest('.scoop-input-wrapper'))return false;var r=t.getBoundingClientRect();return r.width>60&&r.height>20});var set=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;var n=0;ts.forEach(function(e){if(String(e.value||'').trim())return;set.call(e,T);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));e.dispatchEvent(new Event('blur',{bubbles:true}));n++});return n})()");
+        await sleep(400);
+        log('      文本 ' + a.noText.length + ' 个空框已填通用文案');
+      }
+      await sleep(600);
+    }
+    const fin = await auditState();
+    if (!fin) return { ok: true, fixed: detail.length, left: 0, unknown: true, detail };
+    const left = fin.noPick.length + fin.noFill.length + fin.noDd.length + fin.noText.length;
+    return { ok: left === 0, fixed: detail.length, left, detail };
+  };
+  // 兼容旧名字（doChoice 里还在用）
+  const selfCheck = async (wantMap) => { const r = await preSubmitAudit(wantMap); return r.left === 0 ? 1 : 0; };
   async function doVideo() {
     const v = await ev("(function(){var v=document.querySelector('video');if(!v)return 'null';return JSON.stringify({dur:v.duration||0,cur:v.currentTime||0,ended:v.ended})})()");
     if (!v || v === 'null') return false;
@@ -585,6 +780,7 @@ function solveBlank(stmt, passage) {
         log('      第' + (i + 1) + '题 ' + answers[i] + ' → ' + r2);
       }
     }
+    LAST_ANSWERS = answers.slice();   // 供提交前体检补答用（下标和 pickByIndex 同一套过滤）
     await selfCheck(answers);
     const done = await ev("(function(){return JSON.stringify({sel:document.querySelectorAll('.option.selected').length,qs:document.querySelectorAll('.question-common-abs-reply,.question-basic').length})})()");
     log('    选中 ' + done);
@@ -608,7 +804,13 @@ function solveBlank(stmt, passage) {
       '});' +
       'return JSON.stringify(o)' +
     '})()') || '[]');
-    if (!stmts.length) { log('    没解析到空'); return; }
+    if (!stmts.length) {
+      // kind() 里 ins 也算 input.input-user-answer，但那类框解析不出题干。
+      // 老版本这里 return undefined，主循环照样点提交 —— 等于交白卷。
+      const raw = Number(await ev("(function(){return [].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input,input.input-user-answer')).filter(function(e){return e.offsetParent!==null}).length})()"));
+      log('    没解析到空（页面有 ' + (raw || 0) + ' 个输入框）→ 不提交，留到下一轮');
+      return 'retry';
+    }
 
     const dirs = await ev("(function(){var t=String(document.body.innerText||'').replace(/\\s+/g,' ');var i=t.indexOf('Directions');return i>=0?t.slice(i,i+200):''})()");
     const isListening = needsMedia(dirs);
@@ -647,7 +849,11 @@ function solveBlank(stmt, passage) {
     }
 
     log('    答案 ' + answers.map(a => a || '?').join(' | ').slice(0, 110));
-    if (answers.filter(Boolean).length < stmts.length) { log('    答案不全，不提交'); return; }
+    if (answers.filter(Boolean).length < stmts.length) {
+      // 一个空没答案还提交，这一屏就废了（而且主观题常常只记第一次作答）→ 让主循环跳过提交
+      log('    答案不全（' + answers.filter(Boolean).length + '/' + stmts.length + '），这屏不提交');
+      return 'retry';
+    }
     await ev("(function(){var a=" + JSON.stringify(answers) + ";" +
       "var ins=[].slice.call(document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input'));" +
       "ins.sort(function(p,q){if(Math.abs(p.offsetTop-q.offsetTop)>6)return p.offsetTop-q.offsetTop;return p.offsetLeft-q.offsetLeft});" +
@@ -697,6 +903,7 @@ function solveBlank(stmt, passage) {
     }
     const n = await ev("(function(){return [].slice.call(document.querySelectorAll('textarea')).filter(function(t){return t.offsetParent!==null&&!t.closest('.scoop-input-wrapper')&&!/评论/.test(t.placeholder||'')&&!t.closest('[class*=discussion]')&&t.getBoundingClientRect().width>60}).length})()");
     if (!n) { log('    没有答题框'); return; }
+    if (!USE_FILLER) { log('    主观题 ' + n + ' 个：控制台关了「主观题写通用答案」→ 留空不写'); return; }
     await ev("(function(){" +
       "var ts=[].slice.call(document.querySelectorAll('textarea')).filter(function(t){return t.offsetParent!==null&&!t.closest('.scoop-input-wrapper')&&!/评论/.test(t.placeholder||'')&&!t.closest('[class*=discussion]')&&t.getBoundingClientRect().width>60});" +
       "var set=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;" +
@@ -1150,12 +1357,18 @@ function solveBlank(stmt, passage) {
   }
   async function submit() {
     // 分页题：出现「下一题」就翻页，翻到底再提交
+    // v1.1.8：老版本不校验翻页是否成功 —— 最后一页的「下一题」还在（只是点不动），
+    // 于是空转 8 次、每次都要等 waitKind，白白耗掉一分钟多，而且会把同一屏反复处理。
+    const pageSig = () => ev("(function(){var t=String(document.body.innerText||'').replace(/\\s+/g,' ');var n=document.querySelectorAll('.scoop-input-wrapper input,.comp-abs-input input,.option,[class*=sequence-reply-view-item],textarea').length;return n+'|'+t.slice(0,160)})()");
     for (let page = 0; page < 8; page++) {
       const next = await btn(['下一题']);
       if (!next) break;
+      const sig0 = await pageSig();
       await click(next.x, next.y);
       log('    下一题 → 第' + (page + 2) + '页');
       await sleep(2500);
+      const sig1 = await pageSig();
+      if (sig0 && sig1 && sig0 === sig1) { log('    页面没变（应该是最后一页/按钮点不动），不再翻'); break; }
       try {
         const k2 = await waitKind();
         log('      第' + (page + 2) + '页 ' + JSON.stringify(k2));
@@ -1167,6 +1380,8 @@ function solveBlank(stmt, passage) {
         else if (k2.dd > 0) await doSelect(k2);
         else if (k2.qa >= 1) await doQA(k2);
         else log('      本页无可答内容');
+        // 每一页提交前都体检一次，别指望上一页填过的还在
+        await preSubmitAudit(LAST_ANSWERS, {});
       } catch (e) { log('    翻页后处理异常 ' + e.message); }
     }
     const cont = await btn(['继续学习']);
@@ -1182,8 +1397,16 @@ function solveBlank(stmt, passage) {
         saveState();
         return true;
       }
+      log('    !! 这屏既没有「提交」也没有「发布」，可能没加载完');
       return false;
     }
+    // 提交前最后一道关：真点下去之前再查一次有没有空
+    let au = { ok: true, left: 0, detail: [] };
+    try { au = await preSubmitAudit(LAST_ANSWERS, {}); }
+    catch (e) { log('    [warn] 体检异常：' + e.message); }
+    if (!au.ok) log('    !! 体检还剩 ' + au.left + ' 处空着，照样提交（这屏可能丢分）：' + (au.detail.join(' / ') || '-'));
+    if (ANSWER_DELAY > 0) await sleep(Math.min(ANSWER_DELAY, 3000));
+    const sigBefore = await pageSig();
     await click(sub.x, sub.y);
     // 等确认弹窗（说话题/单元测试都会弹「仅记录第一次作答」），最多 9 秒
     let ok = null;
@@ -1202,7 +1425,12 @@ function solveBlank(stmt, passage) {
     }
     log('    提交 → ' + sc + ' 分');
     if (sc && sc !== '?') { STATE.ok = (STATE.ok || 0) + 1; STATE.streakFail = 0; }
-    else { STATE.fail = (STATE.fail || 0) + 1; STATE.streakFail = (STATE.streakFail || 0) + 1; }
+    else {
+      // 没抓到分数不代表提交失败：页面可能整个都换掉了（换屏/换节）
+      const sigAfter = await pageSig();
+      if (sigAfter && sigBefore && sigAfter === sigBefore) log('    !! 页面没变化，提交按钮可能没点上');
+      STATE.fail = (STATE.fail || 0) + 1; STATE.streakFail = (STATE.streakFail || 0) + 1;
+    }
     saveState();
     if (STATE.streakFail >= MAX_FAIL) {
       log('!! 连续 ' + STATE.streakFail + ' 屏没拿到分数，自动暂停等你处理');
@@ -1223,6 +1451,9 @@ function solveBlank(stmt, passage) {
     if (!posRaw || posRaw === 'null') { log('  没有下一节'); return false; }
     await sleep(900);
     const pos = JSON.parse(await ev("(function(){var cont=document.querySelector('.pc-slier-menu-container');var all=[].slice.call(cont.querySelectorAll('.pc-slider-menu-micro')).filter(function(m){return m.offsetParent!==null});var act=all.filter(function(m){return /pc-menu-activity/.test(String(m.className))})[0];var ai=all.indexOf(act);var n=all[ai+1];if(!n)return 'null';var r=n.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),w:Math.round(r.width),h:Math.round(r.height),name:String(n.textContent||'').trim().slice(0,24),lock:/pc-menu-micro-lock/.test(String(n.className))})})()") || 'null');
+    // 上一句和这一句之间隔了 900ms，DOM 可能已经重渲染；pos 要是变成 null，
+    // 老代码下一行 pos.w 就抛 TypeError，一路冒到顶层 catch → 整个 run-all.js 退出。
+    if (!pos) { log('  下一节读不到了（页面在重渲染），本轮不收尾'); return false; }
     if (pos.w < 10 || pos.h < 10) { log('  下一节不在可视区: ' + pos.name); return false; }
     const before = await ev("(function(){var a=null;document.querySelectorAll('.pc-menu-activity').forEach(function(m){a=String(m.textContent||'').trim()});return a})()");
     await click(pos.x, pos.y);
@@ -1269,18 +1500,23 @@ function solveBlank(stmt, passage) {
         await guard();
         const label = tt.t + ' / ' + sc.t;
         STATE.screen = String(label).slice(0, 40); saveState();
+        LAST_ANSWERS = [];   // 上一屏的答案不能带进这一屏
         if (await summary()) { log('  ' + label + ' 已完成 ' + (await score()) + ' 分，跳过'); continue; }
         await sleep(1200);
         const k = await waitKind();
         log('  ' + label + ' ' + JSON.stringify(k));
         if (k.img > 0) {
           const n = await ev("(function(){return document.querySelectorAll('.option').length})()");
+          if (!GUESS_IMG) { log('    选项含图片（' + n + ' 项），控制台关了「随机蒙」→ 这屏跳过'); continue; }
           log('    选项含图片（' + n + ' 项），随机蒙一个后提交');
           if (n > 0) {
             const pick = Math.floor(Math.random() * n);
-            await ev("(function(){var o=document.querySelectorAll('.option')[" + pick + "];if(o)o.click()})()");
+            const box = await jev("(function(){var o=document.querySelectorAll('.option')[" + pick + "];if(!o)return 'null';o.scrollIntoView({block:'center'});var r=o.getBoundingClientRect();return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()", null);
+            // 这个 SPA 里 el.click() 不可靠，有坐标就用坐标点
+            if (box) await click(box.x, box.y); else await ev("(function(){var o=document.querySelectorAll('.option')[" + pick + "];if(o)o.click()})()");
             await sleep(500);
           }
+          try { await preSubmitAudit(LAST_ANSWERS, {}); } catch (e) { log('    [warn] 体检异常：' + e.message); }
           await submit();
           continue;
         }
@@ -1321,12 +1557,17 @@ function solveBlank(stmt, passage) {
               await ev("(function(){var o=document.querySelectorAll('.option')[" + Math.floor(Math.random() * 5) + "];if(o)o.click()})()");
               await sleep(400);
             } else {
-              await ev("(function(){var ts=[].slice.call(document.querySelectorAll('textarea')).filter(function(t){return t.offsetParent!==null});var set=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;ts.forEach(function(e){set.call(e,'" + FILLER_TEXT + "');e.dispatchEvent(new Event('input',{bubbles:true}))})})()");
+              if (USE_FILLER) await ev("(function(){var ts=[].slice.call(document.querySelectorAll('textarea')).filter(function(t){return t.offsetParent!==null});var set=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;ts.forEach(function(e){set.call(e,'" + FILLER_TEXT + "');e.dispatchEvent(new Event('input',{bubbles:true}))})})()");
               await sleep(400);
             }
           }
         } catch (e) { log('    处理异常 ' + e.message); }
         if (skipSubmit) { log('    未拿到依据，本轮不提交'); continue; }
+        // 提交前体检（v1.1.8）：选择/填空/下拉/文本四类全过一遍，漏的补上再提交
+        let au = { ok: true, left: 0, detail: [] };
+        try { au = await preSubmitAudit(LAST_ANSWERS, {}); }
+        catch (e) { log('    [warn] 体检异常：' + e.message); }
+        if (!au.ok) log('    !! 体检后还有 ' + au.left + ' 处空着（' + (au.detail.join(' / ') || '-') + '）→ 照样提交，这屏可能丢分');
         if (NO_SUBMIT) { log('    [POTATO_NO_SUBMIT] 已填好，本轮不提交'); continue; }
         await submit();
       }

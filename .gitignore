@@ -15,6 +15,11 @@ node.path
 control.json
 state.json
 control.json.bak-*
+runner.pid
+.bak-edit-*/
+_scan.js
+_checkjs.js
+_t*.js
 
 # 媒体临时文件
 *.wav

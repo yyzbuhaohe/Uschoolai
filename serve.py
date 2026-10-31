@@ -320,6 +320,77 @@ def _write_json(path, obj):
 
 # ---- 跑课进程托管：UI 点「开始」真的把 run-all.js 拉起来 ----
 RUNNER = {'proc': None, 'started': 0}
+PIDF = os.path.join(ROOT, 'runner.pid')
+_PIDC = {'t': 0.0, 'pid': 0, 'alive': False}
+
+
+def _pid_alive(pid, fresh=False):
+    """pid 还活着吗。
+
+    两条硬要求：
+      1) 不能走 os.kill(pid, 0)。CPython 在 Windows 上的实现是
+         OpenProcess + TerminateProcess(handle, 0) —— 探活会把进程真杀掉。
+      2) 得快。控制台每 2 秒轮询一次，停止流程还要等进程退出；
+         tasklist 一次要 300~450ms，40 次就是十几秒。所以先用 ctypes 直接
+         OpenProcess + GetExitCodeProcess（毫秒级，只读），拿不到再退回 tasklist。
+    """
+    if not pid or pid <= 0:
+        return False
+    now = time.time()
+    if not fresh and _PIDC['pid'] == pid and now - _PIDC['t'] < 1.5:
+        return _PIDC['alive']
+    alive = False
+    if os.name == 'nt':
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+            if h:
+                code = ctypes.c_ulong(0)
+                ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+                k32.CloseHandle(h)
+                alive = bool(ok) and int(code.value) == 259   # STILL_ACTIVE
+            else:
+                alive = False
+        except Exception:
+            try:
+                out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % int(pid), '/NH'],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8,
+                                     creationflags=0x08000000).stdout.decode('utf-8', 'replace')
+                alive = str(int(pid)) in out
+            except Exception:
+                alive = False
+    else:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except Exception:
+            alive = False
+    _PIDC.update({'t': now, 'pid': pid, 'alive': alive})
+    return alive
+
+
+def _read_pidf():
+    try:
+        with open(PIDF, encoding='utf-8-sig') as f:
+            return int((f.read() or '0').strip() or 0)
+    except Exception:
+        return 0
+
+
+def runner_pid():
+    """真正在跑的 run-all.js 的 pid。
+
+    先看这个进程记住的 Popen，再看 runner.pid —— 后者是给「serve.cmd 重启过、
+    旧 run-all.js 变孤儿」这种情况留的：那种时候 RUNNER['proc'] 是 None，
+    老代码会认定「没在跑」，于是停止按钮空转、再点开始就起第二个进程打同一屏。
+    """
+    p = RUNNER.get('proc')
+    if p is not None and p.poll() is None:
+        return p.pid
+    pid = _read_pidf()
+    return pid if _pid_alive(pid) else 0
+
 
 def find_node():
     """按 node.path → 常见安装目录 → PATH 的顺序找 node.exe。
@@ -377,12 +448,30 @@ def store_api_key(cur, plain):
 
 
 def runner_alive():
-    p = RUNNER.get('proc')
-    return bool(p and p.poll() is None)
+    return runner_pid() > 0
+
+
+def _kill_tree(pid):
+    """硬杀一棵进程树：run-all.js 会用 spawnSync 拉起 dub.js，只 terminate 父进程会留孤儿配音进程。"""
+    if not pid:
+        return False
+    try:
+        if os.name == 'nt':
+            r = subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
+                               creationflags=0x08000000)
+            return r.returncode == 0
+        os.kill(pid, 9)
+        return True
+    except Exception:
+        return False
+
 
 def start_runner(max_sec):
-    if runner_alive():
-        return {'ok': True, 'already': True, 'pid': RUNNER['proc'].pid}
+    pid = runner_pid()
+    if pid:
+        # 关键：以前这里只看 RUNNER['proc']，serve 重启过一次就再也拦不住第二个 runner
+        return {'ok': True, 'already': True, 'pid': pid}
     node = find_node()
     if not node:
         return {'ok': False, 'err': '找不到 node.exe（PATH 里没有，node.path 也没有）。'
@@ -400,23 +489,64 @@ def start_runner(max_sec):
         out.close()
     RUNNER['proc'] = p
     RUNNER['started'] = time.time()
-    return {'ok': True, 'pid': p.pid, 'maxSec': max_sec}
-
-def stop_runner():
-    p = RUNNER.get('proc')
-    if not p or p.poll() is not None:
-        return {'ok': True, 'already': True}
     try:
-        p.terminate()
-        for _ in range(20):
-            if p.poll() is not None:
-                break
-            time.sleep(0.1)
-        if p.poll() is None:
-            p.kill()
+        with open(PIDF, 'w', encoding='utf-8') as f:
+            f.write(str(p.pid))
     except Exception:
         pass
-    return {'ok': True, 'pid': p.pid}
+    _PIDC.update({'t': time.time(), 'pid': p.pid, 'alive': True})
+    return {'ok': True, 'pid': p.pid, 'maxSec': max_sec}
+
+
+def stop_runner():
+    """先软停、再硬杀。
+
+    软停 = 往 control.json 写 state="stop"：run-all.js 的 checkpoint() 塞在 sleep() 里，
+    1~2 秒内自己走到 process.exit（能正常 flush usage、清 pid 文件）。
+    硬杀 = taskkill /F /T，兜住「node 在长阻塞里（转写/模型请求）没轮到 checkpoint」的情况。
+    """
+    pid = runner_pid()
+    soft = False
+    try:
+        cur = _read_json(CTRL, {'state': 'stopped'})
+        cur['state'] = 'stop'
+        _write_json(CTRL, cur)
+        soft = True
+    except Exception:
+        pass
+    if not pid:
+        try:
+            if os.path.exists(PIDF):
+                os.remove(PIDF)
+        except Exception:
+            pass
+        return {'ok': True, 'already': True, 'soft': soft, 'pid': 0}
+
+    p = RUNNER.get('proc')
+    waited = False
+    for _ in range(40):            # 最多等 4 秒让它自己退
+        if p is not None and p.poll() is not None:
+            waited = True
+            break
+        if p is None and not _pid_alive(pid, fresh=True):
+            waited = True
+            break
+        time.sleep(0.1)
+    killed = False
+    if not waited and _pid_alive(pid, fresh=True):
+        killed = _kill_tree(pid)
+    try:
+        if p is not None:
+            p.poll()
+    except Exception:
+        pass
+    try:
+        if os.path.exists(PIDF):
+            os.remove(PIDF)
+    except Exception:
+        pass
+    RUNNER['proc'] = None
+    return {'ok': True, 'pid': pid, 'soft': soft, 'graceful': waited, 'killed': killed}
 
 def api_state():
     st = _read_json(STATE, {})
@@ -447,17 +577,22 @@ def api_state():
     st['fw'] = fw_ok()          # faster-whisper 装好了没
     st['model'] = model_state() # local / hub / none
     st['runner'] = runner_alive()
+    st['runnerPid'] = runner_pid()
     st['usage'] = api_usage()
-    # 进程没了就别再显示「运行中」
-    if not st['runner'] and st.get('state') == 'running':
+    # 进程没了就别再显示「运行中 / 已暂停」；
+    # 反过来，进程还在（哪怕是 serve 重启后留下的孤儿）就绝不能把 control.json 改成 stopped ——
+    # 老代码这里每 2 秒写一次，会把 runner 刚写下的 paused 覆盖掉，暂停按钮看着生效其实没生效。
+    if not st['runner'] and st.get('state') in ('running', 'paused', 'stop'):
         st['state'] = 'stopped'
         try:
             cur = _read_json(CTRL, {'state': 'stopped'})
-            if cur.get('state') == 'running':
+            if cur.get('state') in ('running', 'paused', 'stop'):
                 cur['state'] = 'stopped'
                 _write_json(CTRL, cur)
         except Exception:
             pass
+    elif st.get('state') == 'stop':
+        st['state'] = 'stopped'      # 软停进行中，界面上就是「已停止」
     return st
 
 def _node_info():
@@ -653,14 +788,18 @@ class H(http.server.SimpleHTTPRequestHandler):
                 else:
                     cur = _read_json(CTRL, {'state': 'stopped'})
                     cur['state'] = 'running'
-                    for k in ('maxSec', 'delay', 'rate', 'guess', 'fillerText', 'commentText', 'maxFail', 'pauseEvery'):
+                    # 'filler' 以前漏在这个列表外：控制台那个「主观题写通用答案」勾掉也不生效
+                    for k in ('maxSec', 'delay', 'rate', 'guess', 'filler', 'fillerText',
+                              'commentText', 'maxFail', 'pauseEvery'):
                         if k in data:
                             cur[k] = data[k]
                     if 'apiKey' in data:
                         store_api_key(cur, data.get('apiKey'))
                     _write_json(CTRL, cur)
-                    _write_json(STATE, {'state': 'running', 'section': '-', 'screen': '-', 'ok': 0, 'fail': 0, 'page': ''})
                     res = start_runner(int(cur.get('maxSec') or 3))
+                    # 只有真的新起了一个进程才清进度；点开始去「确认已在跑」的时候别把 ok/fail 清零
+                    if res.get('ok') and not res.get('already'):
+                        _write_json(STATE, {'state': 'running', 'section': '-', 'screen': '-', 'ok': 0, 'fail': 0, 'page': ''})
             except Exception as e:
                 res = {'ok': False, 'err': str(e)[:300]}
             outr = json.dumps(res, ensure_ascii=False).encode('utf-8')
@@ -676,7 +815,13 @@ class H(http.server.SimpleHTTPRequestHandler):
                 cur = _read_json(CTRL, {'state': 'stopped'})
                 act = data.get('action')
                 if act in ('start', 'pause', 'stop'):
-                    cur['state'] = {'start': 'running', 'pause': 'paused', 'stop': 'stopped'}[act]
+                    cur['state'] = {'start': 'running', 'pause': 'paused', 'stop': 'stop'}[act]
+                    # /api/control 说 stop 也得真的把进程停掉，别只改个字段
+                    if act == 'stop':
+                        try:
+                            stop_runner()
+                        except Exception:
+                            pass
                 for k in ('maxSec', 'delay', 'rate', 'guess', 'filler', 'fillerText', 'commentText', 'autoResume', 'maxFail', 'pauseEvery'):
                     if k in data:
                         cur[k] = data[k]
