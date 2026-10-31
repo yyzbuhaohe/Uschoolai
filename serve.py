@@ -91,6 +91,74 @@ def remote_version(max_age=600):
     return ver
 
 
+def _archive_items(zf):
+    """把 zip 条目拆成 (仓库内相对路径, zip 内原名)。
+
+    GitHub 的 archive 会给所有文件套一层 `Uschoolai-main/`。这里不写死这个名字：
+    如果所有条目共用同一个顶层目录就剥掉，没有套层就照原样用 —— 哪天 GitHub 改打包方式也不会全跳过。
+    """
+    names = [n for n in zf.namelist() if not n.endswith('/')]
+    if not names:
+        return []
+    tops = {n.split('/', 1)[0] for n in names}
+    strip = len(tops) == 1 and all('/' in n for n in names)
+    return [((n.split('/', 1)[1] if strip else n), n) for n in names]
+
+
+# 这几样缺一个，更新完就点不开或者跑不起来
+REQUIRED_FILES = ('serve.py', 'run-all.js', 'version.json')
+
+
+def _precheck(rel, data):
+    """覆盖前就地检查这份文件。
+
+    热更新最大的坑：把 serve.py 写坏 → 下次启动就是「双击没反应」，用户只能手动救。
+    所以下载下来的东西先在内存里过一遍，能过才落盘。返回错误字符串，没问题返回 None。
+    """
+    low = rel.lower()
+    if low.endswith('.py'):
+        try:
+            compile(data.decode('utf-8-sig'), rel, 'exec')
+        except Exception as e:
+            return 'Python 语法错误：%s' % str(e)[:120]
+        return None
+    if low.endswith(('.html', '.htm')):
+        txt = data.decode('utf-8', 'replace')
+        if txt.count('<script') != txt.count('</script>'):
+            return '<script> 标签不配对（%d 个开 / %d 个闭）' % (txt.count('<script'), txt.count('</script>'))
+        if '<html' in txt.lower() and '</html>' not in txt.lower():
+            return 'HTML 没有 </html>，文件可能被截断'
+        return None
+    if low.endswith('.json'):
+        try:
+            json.loads(data.decode('utf-8-sig'))
+        except Exception as e:
+            return 'JSON 解析失败：%s' % str(e)[:80]
+        return None
+    return None
+
+
+def _rollback(bakdir, written):
+    """把本次已经写下去的文件按备份换回来；备份里没有的（原本不存在）直接删掉。
+
+    半新半旧比不更新更坏：老的 serve.py + 新的 ui.html 会互相调不通。
+    """
+    ok, bad = 0, []
+    for rel in reversed(written):
+        dst = os.path.join(ROOT, rel.replace('/', os.sep))
+        src = os.path.join(bakdir, rel.replace('/', os.sep))
+        try:
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                ok += 1
+            elif os.path.exists(dst):
+                os.remove(dst)
+                ok += 1
+        except Exception:
+            bad.append(rel)
+    return ok, bad
+
+
 def api_update(data=None):
     """从 GitHub 拉最新代码覆盖本地。只动代码和文档，control.json / state.json / usage.json 一律不碰。
 
@@ -103,7 +171,6 @@ def api_update(data=None):
     force = bool(data.get('force'))
     keep = {'control.json', 'state.json', 'usage.json', 'logs'}
     bak = os.path.join(ROOT, '.bak-update')
-    changed, failed = [], []
     local_ver = disk_version()
     diag = {'remote': 0, 'local': int(local_ver.get('build', 0) or 0), 'zipBytes': 0,
             'entries': 0, 'force': force, 'reason': ''}
@@ -146,18 +213,9 @@ def api_update(data=None):
         return {'ok': True, 'n': 0, 'changed': [], 'build': remote_build, 'local': local_build, 'diag': diag,
                 'msg': '已经是最新：本地 build %d，远端 build %d' % (local_build, remote_build)}
 
-    try:
-        os.makedirs(bak, exist_ok=True)
-    except Exception:
-        pass
-
-    for item in zf.infolist():
-        if item.is_dir():
-            continue
-        parts = item.filename.split('/', 1)
-        if len(parts) != 2:
-            continue
-        rel = parts[1]
+    # ---- 3) 覆盖前预检：宁可这次不更新，也别把 serve.py 写成语法错误 ----
+    plan = []
+    for rel, name in _archive_items(zf):
         head = rel.split('/')[0]
         if head in keep:
             continue
@@ -166,40 +224,87 @@ def api_update(data=None):
             continue
         if rel.endswith('.pyc') or '__pycache__' in rel:
             continue
+        try:
+            plan.append((rel, zf.read(name)))
+        except Exception as e:
+            diag['reason'] = 'zip 条目读不出来：' + str(e)[:80]
+            return {'ok': False, 'diag': diag, 'err': 'main.zip 里有条目读不出来：%s' % str(e)[:120]}
+
+    miss = [f for f in REQUIRED_FILES if not any(p[0] == f for p in plan)]
+    if miss:
+        diag['reason'] = '远端包不完整：缺 ' + ', '.join(miss)
+        _ulog('远端包不完整，缺：' + ', '.join(miss))
+        return {'ok': False, 'diag': diag,
+                'err': '远端这套文件缺 %s，不敢覆盖（本地一个字节都没动）' % ', '.join(miss)}
+
+    bad = []
+    for rel, blob in plan:
+        err = _precheck(rel, blob)
+        if err:
+            bad.append('%s → %s' % (rel, err))
+    if bad:
+        diag['reason'] = '预检不通过'
+        _ulog('预检不通过，拒绝覆盖：' + '; '.join(bad[:5]))
+        return {'ok': False, 'diag': diag,
+                'err': '远端这版没通过覆盖前预检，已拒绝（本地一个字节都没动）：' + ' / '.join(bad[:3])}
+
+    # ---- 4) 落盘：备份按时间戳分目录并保留原目录结构，中途失败整批回滚 ----
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    bakdir = os.path.join(bak, stamp)
+    written, failed = [], []
+    for rel, blob in plan:
         dst = os.path.join(ROOT, rel.replace('/', os.sep))
         try:
-            os.makedirs(os.path.dirname(dst), exist_ok=True) if os.path.dirname(dst) else None
             old = None
             if os.path.exists(dst):
                 with open(dst, 'rb') as f:
                     old = f.read()
-            new = zf.read(item)
-            if old == new:
+            if old == blob:
                 continue
             if old is not None:
-                b = os.path.join(bak, rel.replace('/', '_'))
-                with open(b, 'wb') as f:
+                bdst = os.path.join(bakdir, rel.replace('/', os.sep))
+                bdir = os.path.dirname(bdst)
+                if bdir:
+                    os.makedirs(bdir, exist_ok=True)
+                with open(bdst, 'wb') as f:
                     f.write(old)
+            pdir = os.path.dirname(dst)
+            if pdir:
+                os.makedirs(pdir, exist_ok=True)
             with open(dst, 'wb') as f:
-                f.write(new)
-            changed.append(rel)
+                f.write(blob)
+            written.append(rel)
         except Exception as e:
             failed.append('%s: %s' % (rel, str(e)[:60]))
 
     if failed:
-        _ulog('部分文件失败：%s' % '; '.join(failed[:5]))
-        return {'ok': False, 'err': '部分文件失败（可能是文件被占用或没有写权限）：' + '; '.join(failed[:3]),
-                'changed': changed, 'diag': diag}
-    if remote_build:
+        restored, rbad = _rollback(bakdir, written)
+        diag['reason'] = '写入失败并已回滚'
+        _ulog('写入失败 %d 个：%s；回滚 %d 个%s' % (len(failed), '; '.join(failed[:5]), restored,
+                                                ('，回滚失败：' + ', '.join(rbad[:3])) if rbad else ''))
+        return {'ok': False, 'diag': diag, 'changed': [],
+                'err': '写入失败（文件被占用 / 没写权限？）：%s\n已回滚 %d 个文件，其余没动，本地仍是 build %d。%s'
+                       % ('; '.join(failed[:3]), restored, local_build,
+                          ('回滚也有失败：' + ', '.join(rbad[:3])) if rbad else '')}
+
+    # 备份目录留个 LATEST.txt，rollback.cmd 就靠它找最近一次
+    if written:
         try:
-            _write_json(os.path.join(ROOT, 'version.json'), remote_ver)
+            with open(os.path.join(bak, 'LATEST.txt'), 'w', encoding='utf-8') as f:
+                f.write(stamp + '\n')
         except Exception:
             pass
-    _ulog('更新 %d 个文件：本地 %d → 远端 %d%s' % (len(changed), local_build, remote_build, '（强制）' if force else ''))
+
+    try:
+        _write_json(os.path.join(ROOT, 'version.json'), remote_ver)
+    except Exception:
+        pass
+    _ulog('更新 %d 个文件：本地 %d → 远端 %d%s；备份 %s' % (len(written), local_build, remote_build,
+                                                    '（强制）' if force else '', stamp))
     msg = '%s → %s（build %d → %d）' % (local_ver.get('name') or '?', (remote_ver or {}).get('name') or '?',
                                         local_build, remote_build)
-    return {'ok': True, 'changed': changed, 'n': len(changed), 'backup': bak, 'build': remote_build,
-            'local': local_build, 'msg': msg, 'diag': diag,
+    return {'ok': True, 'changed': written, 'n': len(written), 'backup': bakdir if written else bak,
+            'build': remote_build, 'local': local_build, 'msg': msg, 'diag': diag,
             'restart': bool(local_build and remote_build != local_build)}
 
 

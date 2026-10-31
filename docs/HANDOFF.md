@@ -1,11 +1,11 @@
-# 交接文档（2026-10 · v1.1.9）
+# 交接文档（2026-10 · v1.2.0）
 
 写给下一个接手的人（或者下一个会话里的我）。读完这份应该能直接改代码，不用重新踩坑。
 
 - 仓库：<https://github.com/yyzbuhaohe/Uschoolai>（main 分支即发布源，控制台「检查更新」拉的就是它）
-- 当前版本：`version.json` → `build 2026103010 / v1.1.9`
+- 当前版本：`version.json` → `build 2026103011 / v1.2.0`
 - 代码目录：工作区里的 `rea/unipus/`
-- **v1.1.8 改了什么 + 还没修的坑**：见 `docs/BUGS-1.1.8.md`（P1~P15 是待办，按概率排的）
+- **v1.1.8 改了什么 + 还没修的坑**：见 `docs/BUGS-1.1.8.md`（P1~P16 是待办，按概率排的）
 
 ---
 
@@ -190,6 +190,36 @@ Chrome/Edge --remote-debugging-port=9222 --user-data-dir=%LOCALAPPDATA%\potato-d
 - 改完必须 `build + 1`（远端 ≤ 本地时"检查更新"会直接判定最新，等于这次修复白做）
 - 只改文档也要 +1，否则老机器拿不到
 - `-full` 包和普通包都从 `dist/unipus`（`make-pack.ps1` 的产物）压，别手改 `dist`
+- **新增依赖不能靠热更新**：热更新只换文件，不装 pip/npm 包。哪天 `serve.py` 里 `import` 了新东西，老机器更新完就是起不来 —— 这种改动必须在 Release 说明里写"重跑 install.cmd"，或者干脆别引入新依赖
+- **删掉/改名文件不会被同步**：更新只写不删，老机器上会留着旧文件。真要清就发一次带清理清单的版本
+
+### 4.11 更新出事了怎么办（两级保险 + 一条命令回退）
+
+热更新落地前有两道闸（v1.2.0 起）：
+
+| 闸 | 做什么 | 不过会怎样 |
+|---|---|---|
+| 覆盖前预检 | `.py` 一律 `compile()`；`.html` 查 `<script>` 配对和 `</html>`；`.json` 一律 `json.loads()`；还要求包里有 `serve.py` / `run-all.js` / `version.json` | 整批拒绝，**本地一个字节都不写**，报错里写清哪个文件哪一行 |
+| 写入时回滚 | 任何文件写失败（被占用、只读、没权限），用本次备份把已写的倒回去 | `version.json` 不推进，本地仍是旧 build，报错里写"已回滚 N 个" |
+
+备份位置：`.bak-update\<YYYYmmdd-HHMMSS>\<原目录结构>`，最近一次的目录名记在 `.bak-update\LATEST.txt`。
+
+回退：
+
+```cmd
+:: 双击（会问一次 y/N；先关掉 serve 窗口）
+rollback.cmd
+```
+
+手动核对：
+
+```powershell
+Get-Content .bak-update\LATEST.txt                      # 最近一次备份
+Get-ChildItem .bak-update\<那个时间戳> -Recurse -File    # 备份了哪些文件
+Invoke-RestMethod http://127.0.0.1:8787/api/state | Select-Object build,diskBuild,stale
+```
+
+注意 `rollback.cmd` 只还原、不删除 —— 更新**新增**的文件会留着（无害）。
 
 ---
 
@@ -245,6 +275,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .dev\make-pack.ps1 -Out "..\
 | 检查更新说「已是最新」但其实没更新 | v1.1.9 起会写清本地/远端 build 和原因；还看不明白就看 `logs/update.log` |
 | 更新完了功能没变 | 磁盘换了、进程还是旧代码 → 界面版本那行会写「磁盘 X / 进程 Y（要重启）」，重开 serve.cmd |
 | 检查更新一直报下载失败 | 这台机器连不上 github.com / codeload，走代理或手动换 serve.py |
+| 检查更新报「没通过覆盖前预检」 | 远端那版被写坏了（serve.py 语法错 / HTML 标签不配对），本地没动；等修好再点 |
+| 检查更新报「写入失败…已回滚」 | 有文件被占用或只读：关掉 serve 窗口 / 取消只读（`attrib -R 文件`）再点 |
+| 更新完想退回去 | `rollback.cmd`（读 `.bak-update\LATEST.txt`），然后重开 serve.cmd |
 | `install.ps1` 满屏"缺少右大括号" | 文件丢了 UTF-8 BOM（PS5.1 按 GBK 读了） |
 | `.cmd` 乱码 | 里面写了中文（必须纯 ASCII + CRLF） |
 | `timeout /t` 报 Input redirection | 重定向了 stdin；等待统一用 `ping -n N 127.0.0.1 >nul` |
@@ -279,6 +312,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .dev\make-pack.ps1 -Out "..\
 | v1.1.7 | 2026103008 | 修说话题没声音（录音按钮坐标点击 + 确认 gUM） |
 | v1.1.8 | 2026103009 | 提交前体检（选择/填空/下拉/文本四类补漏）+ 修开始/停止/暂停（软停认 stop、孤儿按 pid 杀、暂停秒响应）+ `ev` 不再因 `'EXC'` 崩进程 |
 | v1.1.9 | 2026103010 | 修热更新：`n=0` 不再一律说"最新"（带 diag/msg）、加强制更新、加「磁盘新/进程旧 → 重启 serve」的显式提示、`logs/update.log` |
+| v1.2.0 | 2026103011 | 热更新两道闸：覆盖前预检（Python 语法 / HTML 标签 / JSON，外加必备文件清单）、写入失败整批自动回滚；备份改成按时间戳分目录保留原结构 + `rollback.cmd` 一条命令回退 |
 
 ---
 
