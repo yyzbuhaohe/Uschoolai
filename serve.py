@@ -45,42 +45,111 @@ def api_usage_reset():
 
 
 REPO_ZIP = 'https://github.com/yyzbuhaohe/Uschoolai/archive/refs/heads/main.zip'
+REPO_RAW = 'https://raw.githubusercontent.com/yyzbuhaohe/Uschoolai/main/version.json'
+# 启动时记下"这个进程加载的是哪一版"：更新完 version.json 会变成新号，
+# 但内存里还是旧代码 —— 两者不一致就说明要重启 serve.cmd，界面上要明说。
+BOOT_BUILD = 0
+BOOT_NAME = ''
+_VERCACHE = {'t': 0.0, 'ver': None}
 
 
-def api_update():
-    """从 GitHub 拉最新代码覆盖本地。只动代码和文档，control.json / state.json / usage.json 一律不碰。"""
+def _ulog(msg):
+    """更新流程单独写一份日志，出问题的机器把这个文件发过来就能定位。"""
+    try:
+        os.makedirs(LOGD, exist_ok=True)
+        with open(os.path.join(LOGD, 'update.log'), 'a', encoding='utf-8') as f:
+            f.write('[%s] %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg))
+    except Exception:
+        pass
+
+
+def disk_version():
+    return _read_json(os.path.join(ROOT, 'version.json'), {}) or {}
+
+
+def _fetch_raw_version():
+    """兜底：直接读 main 上的 version.json（main.zip 里读不到时的后路）。"""
+    try:
+        import urllib.request as _u
+        req = _u.Request(REPO_RAW, headers={'User-Agent': 'potato-updater', 'Cache-Control': 'no-cache'})
+        txt = _u.urlopen(req, timeout=20).read().decode('utf-8-sig')
+        ver = json.loads(txt)
+        if int(ver.get('build', 0) or 0):
+            return ver
+    except Exception as e:
+        _ulog('raw version.json 也读不到：%s' % str(e)[:120])
+    return None
+
+
+def remote_version(max_age=600):
+    """远端现在是多少（10 分钟缓存）。拿不到返回 None，不要去猜。"""
+    if _VERCACHE['ver'] and time.time() - _VERCACHE['t'] < max_age:
+        return _VERCACHE['ver']
+    ver = _fetch_raw_version()
+    if ver:
+        _VERCACHE.update({'t': time.time(), 'ver': ver})
+    return ver
+
+
+def api_update(data=None):
+    """从 GitHub 拉最新代码覆盖本地。只动代码和文档，control.json / state.json / usage.json 一律不碰。
+
+    返回里带 diag（远端/本地 build、下载字节、条目数、判定原因），
+    这样"为什么说已是最新"能在界面上直接说清，不用连麦猜。
+    """
     import io, zipfile
     import urllib.request as _u
+    data = data or {}
+    force = bool(data.get('force'))
     keep = {'control.json', 'state.json', 'usage.json', 'logs'}
     bak = os.path.join(ROOT, '.bak-update')
     changed, failed = [], []
+    local_ver = disk_version()
+    diag = {'remote': 0, 'local': int(local_ver.get('build', 0) or 0), 'zipBytes': 0,
+            'entries': 0, 'force': force, 'reason': ''}
+
     try:
-        req = _u.Request(REPO_ZIP, headers={'User-Agent': 'potato-updater'})
+        req = _u.Request(REPO_ZIP, headers={'User-Agent': 'potato-updater', 'Accept': '*/*'})
         raw = _u.urlopen(req, timeout=60).read()
+        diag['zipBytes'] = len(raw)
         zf = zipfile.ZipFile(io.BytesIO(raw))
+        diag['entries'] = len(zf.infolist())
     except Exception as e:
-        return {'ok': False, 'err': '下载失败：%s' % str(e)[:160]}
+        _ulog('下载 main.zip 失败：%s' % str(e)[:200])
+        return {'ok': False, 'err': '下载 main.zip 失败：%s' % str(e)[:160], 'diag': diag}
+
+    # 远端版本：先在 zip 里找，找不到再走 raw
+    remote_ver = None
+    try:
+        cand = [n for n in zf.namelist() if n.endswith('/version.json') or n == 'version.json']
+        if cand:
+            remote_ver = json.loads(zf.read(cand[0]).decode('utf-8-sig'))
+    except Exception as e:
+        _ulog('zip 里的 version.json 解析失败：%s' % str(e)[:120])
+        remote_ver = None
+    if not remote_ver:
+        diag['reason'] = 'zip 里没读到 version.json，改用 raw 比对'
+        remote_ver = _fetch_raw_version()
+    remote_build = int((remote_ver or {}).get('build', 0) or 0)
+    diag['remote'] = remote_build
+    local_build = diag['local']
+
+    if not remote_build:
+        _ulog('拿不到远端版本号（zip 条目 %d，下载 %d 字节）' % (diag['entries'], diag['zipBytes']))
+        return {'ok': False, 'diag': diag,
+                'err': '拿不到远端版本号：main.zip 里没有 version.json，raw 也读不到（可能被网络/代理拦了）。'
+                       '确认能打开 github.com 后重试，或者点「强制更新」直接覆盖。'}
+
+    if not force and local_build and remote_build <= local_build:
+        diag['reason'] = '远端不比本地新'
+        _ulog('跳过：本地 %d / 远端 %d' % (local_build, remote_build))
+        return {'ok': True, 'n': 0, 'changed': [], 'build': remote_build, 'local': local_build, 'diag': diag,
+                'msg': '已经是最新：本地 build %d，远端 build %d' % (local_build, remote_build)}
 
     try:
         os.makedirs(bak, exist_ok=True)
     except Exception:
         pass
-
-    # 先看远端版本，比本地旧就不覆盖（防止把新功能刷回旧版）
-    try:
-        remote_ver = json.loads(zf.read([n for n in zf.namelist() if n.endswith('/version.json')][0]).decode('utf-8'))
-        remote_build = int(remote_ver.get('build', 0) or 0)
-    except Exception:
-        remote_build = 0
-    try:
-        local_build = int(_read_json(os.path.join(ROOT, 'version.json'), {}).get('build', 0) or 0)
-    except Exception:
-        local_build = 0
-    if not remote_build:
-        # 远端没有 version.json 就不知道谁新谁旧，宁可不更新
-        return {'ok': True, 'n': 0, 'changed': [], 'msg': '远端缺少 version.json，跳过更新以免把本地刷成旧版'}
-    if local_build and remote_build <= local_build:
-        return {'ok': True, 'n': 0, 'changed': [], 'msg': '本地 %d，远端 %d，已是最新' % (local_build, remote_build)}
 
     for item in zf.infolist():
         if item.is_dir():
@@ -91,6 +160,9 @@ def api_update():
         rel = parts[1]
         head = rel.split('/')[0]
         if head in keep:
+            continue
+        # 仓库自用的东西不下发到用户机器：GitHub actions、开发脚本
+        if head in ('.github', '.dev', '.vscode'):
             continue
         if rel.endswith('.pyc') or '__pycache__' in rel:
             continue
@@ -115,13 +187,20 @@ def api_update():
             failed.append('%s: %s' % (rel, str(e)[:60]))
 
     if failed:
-        return {'ok': False, 'err': '部分文件失败：' + '; '.join(failed[:3]), 'changed': changed}
+        _ulog('部分文件失败：%s' % '; '.join(failed[:5]))
+        return {'ok': False, 'err': '部分文件失败（可能是文件被占用或没有写权限）：' + '; '.join(failed[:3]),
+                'changed': changed, 'diag': diag}
     if remote_build:
         try:
             _write_json(os.path.join(ROOT, 'version.json'), remote_ver)
         except Exception:
             pass
-    return {'ok': True, 'changed': changed, 'n': len(changed), 'backup': bak, 'build': remote_build}
+    _ulog('更新 %d 个文件：本地 %d → 远端 %d%s' % (len(changed), local_build, remote_build, '（强制）' if force else ''))
+    msg = '%s → %s（build %d → %d）' % (local_ver.get('name') or '?', (remote_ver or {}).get('name') or '?',
+                                        local_build, remote_build)
+    return {'ok': True, 'changed': changed, 'n': len(changed), 'backup': bak, 'build': remote_build,
+            'local': local_build, 'msg': msg, 'diag': diag,
+            'restart': bool(local_build and remote_build != local_build)}
 
 
 def get_model():
@@ -579,6 +658,15 @@ def api_state():
     st['runner'] = runner_alive()
     st['runnerPid'] = runner_pid()
     st['usage'] = api_usage()
+    # 版本与"要不要重启"：更新只换磁盘上的文件，进程内存里还是旧代码。
+    # 不把这件事说清楚，用户会以为「更新成功但没变化」，再看版本号又显示最新。
+    dv = disk_version()
+    d_build = int(dv.get('build', 0) or 0)
+    b_build = int(BOOT_BUILD or 0)
+    st['build'] = b_build or d_build
+    st['buildName'] = BOOT_NAME or str(dv.get('name') or '')
+    st['diskBuild'] = d_build
+    st['stale'] = bool(b_build and d_build and d_build > b_build)
     # 进程没了就别再显示「运行中 / 已暂停」；
     # 反过来，进程还在（哪怕是 serve 重启后留下的孤儿）就绝不能把 control.json 改成 stopped ——
     # 老代码这里每 2 秒写一次，会把 runner 刚写下的 paused 覆盖掉，暂停按钮看着生效其实没生效。
@@ -663,6 +751,24 @@ def api_selfcheck():
     else:
         add('key', 'error', '还没填 DeepSeek API Key（docs/API-KEY.md）')
 
+    # 版本：本地 / 远端各一行，比翻日志快（远端 10 分钟缓存，不会每次体检都打 GitHub）
+    dv = disk_version()
+    d_build = int(dv.get('build', 0) or 0)
+    add('version', 'ok' if d_build else 'warn',
+        ('本地 %s（build %d）' % (dv.get('name') or '?', d_build)) if d_build else '本地没有 version.json，版本未知')
+    if int(BOOT_BUILD or 0) and d_build and d_build > int(BOOT_BUILD):
+        add('restart', 'warn', '磁盘上已经是 build %d，这个进程还跑着 build %d → 关掉 serve 窗口重开 serve.cmd 才生效'
+            % (d_build, int(BOOT_BUILD)))
+    rv = remote_version()
+    if rv:
+        r_build = int(rv.get('build', 0) or 0)
+        if d_build and r_build > d_build:
+            add('remote', 'warn', '远端有新版本 %s（build %d），点「检查更新」升级' % (rv.get('name') or '?', r_build))
+        else:
+            add('remote', 'ok', '远端 %s（build %d），本地已是最新' % (rv.get('name') or '?', r_build))
+    else:
+        add('remote', 'warn', '读不到远端版本：这台机器访问 github.com 有问题（代理/墙），检查更新会失败')
+
     bad = [c for c in checks if c['level'] == 'error']
     warn = [c for c in checks if c['level'] == 'warn']
     return {'ok': not bad, 'errors': len(bad), 'warns': len(warn), 'checks': checks}
@@ -677,6 +783,9 @@ def api_log(after):
     if after < 0 or after > len(lines):
         after = max(0, len(lines) - 300)
     tail = lines[after:][-200:]
+    # next 只推进"真正发出去的行数"：以前直接给 len(lines)，一次超过 200 行
+    # （转写/模型请求密集时很正常）中间那些行就永远看不到了
+    next_id = after + len(tail)
     out = []
     for ln in tail:
         t = ln.rstrip('\n')
@@ -690,7 +799,7 @@ def api_log(after):
         if '===' in t:
             cls = 'dim'
         out.append({'text': t, 'cls': cls})
-    return {'lines': out, 'next': len(lines)}
+    return {'lines': out, 'next': next_id}
 class H(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=ROOT, **kw)
@@ -759,7 +868,13 @@ class H(http.server.SimpleHTTPRequestHandler):
         n = int(self.headers.get('content-length') or 0)
         body = self.rfile.read(n) if n else b'{}'
         if p == '/api/update':
-            res = api_update()
+            try:
+                udata = json.loads(body.decode('utf-8') or '{}') if body else {}
+                if not isinstance(udata, dict):
+                    udata = {}
+            except Exception:
+                udata = {}
+            res = api_update(udata)
             outr = json.dumps(res, ensure_ascii=False).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -972,6 +1087,9 @@ class Srv(socketserver.ThreadingTCPServer):
 
 if __name__ == '__main__':
     ensure_control()
+    _v0 = disk_version()
+    BOOT_BUILD = int(_v0.get('build', 0) or 0)
+    BOOT_NAME = str(_v0.get('name') or '')
     if not fw_ok():
         print('[!] 当前 Python %d.%d 里没有 faster-whisper（3.13/3.14 装不上）。' % sys.version_info[:2], flush=True)
         print('    服务能起来，但转写 / 排序 / 跟读 / 配音都用不了。', flush=True)

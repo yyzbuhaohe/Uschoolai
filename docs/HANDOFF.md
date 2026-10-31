@@ -1,11 +1,11 @@
-# 交接文档（2026-10 · v1.1.8）
+# 交接文档（2026-10 · v1.1.9）
 
 写给下一个接手的人（或者下一个会话里的我）。读完这份应该能直接改代码，不用重新踩坑。
 
 - 仓库：<https://github.com/yyzbuhaohe/Uschoolai>（main 分支即发布源，控制台「检查更新」拉的就是它）
-- 当前版本：`version.json` → `build 2026103009 / v1.1.8`
+- 当前版本：`version.json` → `build 2026103010 / v1.1.9`
 - 代码目录：工作区里的 `rea/unipus/`
-- **v1.1.8 改了什么 + 还没修的坑**：见 `docs/BUGS-1.1.8.md`（P1~P14 是待办，按概率排的）
+- **v1.1.8 改了什么 + 还没修的坑**：见 `docs/BUGS-1.1.8.md`（P1~P15 是待办，按概率排的）
 
 ---
 
@@ -160,6 +160,37 @@ Chrome/Edge --remote-debugging-port=9222 --user-data-dir=%LOCALAPPDATA%\potato-d
 - `checkpoint()` 塞进了 `sleep()`（≤1.2 秒一次读控制文件），跟读刷页/等 TTS 中途点暂停也立刻响应。
 - Windows 上**不要**用 `os.kill(pid, 0)` 探活：CPython 的实现是 `OpenProcess + TerminateProcess(handle, 0)`，探活=杀进程。用 `ctypes` 的 `OpenProcess + GetExitCodeProcess`。
 
+### 4.9 热更新（v1.1.9 重做）
+
+老实现只有一个「已是最新」出口：`n == 0` 的三种完全不同的情况（真的最新 / 远端读不到 version.json / 内容一模一样）在界面上全说成"已经是最新版"，用户根本没法判断。现在：
+
+- **返回带 `diag`**：`{remote, local, zipBytes, entries, force, reason}`，界面原样贴出来
+- **判定分支说人话**：
+  - `ok:false` → 「下载 main.zip 失败」/「拿不到远端版本号（zip 里没有 + raw 也读不到）」
+  - `ok:true n:0` → `msg` 里写清「已经是最新：本地 build X，远端 build Y」
+  - `ok:true n>0` → `msg` 写「v1.1.7 → v1.1.8（build … → …）」，返回 `restart:true`
+- **兜底**：zip 里找不到 `version.json` 就单独读 `raw.githubusercontent.com/.../main/version.json`（10 分钟缓存，体检也用这份）
+- **强制更新**：`POST /api/update {"force":true}`，跳过 build 比较直接覆盖（给"版本号乱了"的机器一条活路）
+- **要重启这件事必须显式**：`serve.py` 启动时把当次的 build 记进 `BOOT_BUILD`，`/api/state` 返回 `build`（进程）+ `diskBuild`（磁盘）+ `stale`。更新完 `version.json` 变新号而进程还是旧代码 → 界面黄条「代码已更新到 X，当前进程还跑着 Y，重启 serve.cmd」。**不这么写，用户会以为"更新成功但没变化"，再点一次又显示"最新"**（因为 version.json 已经是新的了）
+- **日志**：`logs/update.log` 记下载字节、条目数、判定原因、失败文件。谁的机器有问题，让他把这个文件发过来
+- 更新时**跳过** `.github/` `.dev/` `.vscode/`：仓库自用的东西不下发到用户机器
+
+`/api/log` 一起修了：`next` 现在只推进"真正发出去的行数"，一次超过 200 行不会再把中间那段吞掉。
+
+**老包自带的更新器是旧的，改不动它**：v1.1.0 那个包和仓库不同步，里面的 `api_update()` 和现在这份不是一回事。那种机器只能手动救：
+
+```
+# 手动更新（任选其一）
+1) 重下 Release 包，覆盖除 control.json / state.json / logs / models 之外的文件
+2) 只换更新器：下载 main 上的 serve.py + ui.html 覆盖本地同名文件，关掉 serve 窗口重开
+```
+
+### 4.10 版本号规矩（发版别踩）
+
+- 改完必须 `build + 1`（远端 ≤ 本地时"检查更新"会直接判定最新，等于这次修复白做）
+- 只改文档也要 +1，否则老机器拿不到
+- `-full` 包和普通包都从 `dist/unipus`（`make-pack.ps1` 的产物）压，别手改 `dist`
+
 ---
 
 ## 五、环境与发布
@@ -211,6 +242,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .dev\make-pack.ps1 -Out "..\
 | 暂停了但还在答题 | 老版本只在节/屏边界检查控制文件；v1.1.8 塞进 `sleep()` 了 |
 | 点开始起了两个进程抢同一屏 | `RUNNER['proc']` 掉了但旧进程还活；v1.1.8 用 pid 文件判活 |
 | 日志里「体检通过」但题是空的 | 体检脚本没跑起来（页面结构变了），v1.1.8 会打 warn 而不是通过 |
+| 检查更新说「已是最新」但其实没更新 | v1.1.9 起会写清本地/远端 build 和原因；还看不明白就看 `logs/update.log` |
+| 更新完了功能没变 | 磁盘换了、进程还是旧代码 → 界面版本那行会写「磁盘 X / 进程 Y（要重启）」，重开 serve.cmd |
+| 检查更新一直报下载失败 | 这台机器连不上 github.com / codeload，走代理或手动换 serve.py |
 | `install.ps1` 满屏"缺少右大括号" | 文件丢了 UTF-8 BOM（PS5.1 按 GBK 读了） |
 | `.cmd` 乱码 | 里面写了中文（必须纯 ASCII + CRLF） |
 | `timeout /t` 报 Input redirection | 重定向了 stdin；等待统一用 `ping -n N 127.0.0.1 >nul` |
@@ -244,6 +278,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .dev\make-pack.ps1 -Out "..\
 | v1.1.6 | 2026103007 | 修分页跟读（刷新退回第 1 页 → 自动翻回；重录确认框） |
 | v1.1.7 | 2026103008 | 修说话题没声音（录音按钮坐标点击 + 确认 gUM） |
 | v1.1.8 | 2026103009 | 提交前体检（选择/填空/下拉/文本四类补漏）+ 修开始/停止/暂停（软停认 stop、孤儿按 pid 杀、暂停秒响应）+ `ev` 不再因 `'EXC'` 崩进程 |
+| v1.1.9 | 2026103010 | 修热更新：`n=0` 不再一律说"最新"（带 diag/msg）、加强制更新、加「磁盘新/进程旧 → 重启 serve」的显式提示、`logs/update.log` |
 
 ---
 

@@ -89,12 +89,15 @@
       <label>本地服务 (8787) <span id="chkSrv" class="dim">–</span></label>
       <label>Whisper 模型 <span id="chkStt" class="dim">–</span></label>
       <label>跑课进程 <span id="chkRunner" class="dim">–</span></label>
+      <label>版本 <span id="chkVer" class="dim">–</span></label>
       <label>当前页面 <span id="chkPage" class="dim" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">–</span></label>
       <label>模型用量 <span id="chkUsage" class="dim">–</span></label>
       <div style="display:flex;gap:8px;margin-top:10px">
         <button id="btnUpdate" class="ghost" style="flex:1">检查更新</button>
+        <button id="btnForceUpdate" class="ghost" style="flex:1" title="忽略版本号比较，直接拿 main 覆盖本地代码">强制更新</button>
         <button id="btnUsageReset" class="ghost" style="flex:1">清零用量</button>
       </div>
+      <div id="updateTip" style="display:none;margin-top:10px;padding:8px 10px;border-radius:8px;font-size:12px;line-height:1.5"></div>
     </div>
 
     <div class="card full">
@@ -109,18 +112,53 @@ const $ = s => document.querySelector(s);
 const API = '';
 
 async function jget(p){ try{ const r = await fetch(API+p,{cache:'no-store'}); return await r.json(); }catch(e){ return null; } }
+
+// 更新结果一律原样贴出来：以前 n=0 就一句「已经是最新版」，
+// 把「远端缺 version.json」「网络被拦」「内容其实一样」三种完全不同的情况都说成了最新。
+function showTip(text, kind){
+  const box = document.getElementById('updateTip');
+  if (!box) return;
+  box.style.display = 'block';
+  const color = kind === 'err' ? 'var(--err)' : kind === 'warn' ? 'var(--warn)' : 'var(--ok)';
+  box.style.background = 'rgba(255,255,255,.04)';
+  box.style.border = '1px solid ' + color;
+  box.style.color = color;
+  box.innerHTML = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>');
+}
+
+async function runUpdate(force){
+  const bu = document.getElementById(force ? 'btnForceUpdate' : 'btnUpdate');
+  const label = force ? '强制更新' : '检查更新';
+  if (!confirm(force
+      ? '强制更新：不管版本号，直接用 GitHub 上的 main 覆盖本地代码（control.json / 密钥 / 日志 / 模型不动，旧文件备份在 .bak-update/）。'
+      : '从 GitHub 拉最新代码覆盖本地？\n\ncontrol.json / 密钥 / 日志都不会动，旧文件备份在 .bak-update/。')) return;
+  bu.disabled = true; bu.textContent = '处理中…';
+  const r = await jpost('/api/update', force ? { force: true } : {});
+  bu.disabled = false; bu.textContent = label;
+  if (!r) { showTip('连不上本地服务 8787，serve 窗口还开着吗？', 'err'); return; }
+  const d = r.diag || {};
+  const info = '本地 build ' + (r.local || d.local || '?') + ' / 远端 build ' + (d.remote || r.build || '?')
+             + (d.zipBytes ? '（main.zip ' + Math.round(d.zipBytes / 1024) + ' KB，' + d.entries + ' 项）' : '');
+  if (!r.ok) {
+    showTip('更新失败：' + (r.err || '未知错误') + '\n' + info, 'err');
+    alert('更新失败：' + (r.err || '未知错误') + '\n\n' + info);
+    return;
+  }
+  if (!r.n) {
+    // 关键：把服务端给的原因照抄出来，不再一律说「最新」
+    showTip((r.msg || '没有文件变化') + '\n' + info, 'ok');
+    return;
+  }
+  const list = r.changed.slice(0, 12).join('\n') + (r.changed.length > 12 ? '\n…' : '');
+  showTip('已更新 ' + r.n + ' 个文件：' + (r.msg || '') + '\n' + info + '\n重启 serve.cmd 才生效（旧文件在 .bak-update/）', 'warn');
+  alert('更新了 ' + r.n + ' 个文件：\n' + list + '\n\n' + (r.msg || '') + '\n\n备份在 .bak-update/，关掉 serve 窗口重开 serve.cmd 生效。');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const bu = document.getElementById('btnUpdate');
-  if (bu) bu.onclick = async () => {
-    if (!confirm('从 GitHub 拉最新代码覆盖本地？\n\ncontrol.json / 密钥 / 日志都不会动，旧文件备份在 .bak-update/。')) return;
-    bu.disabled = true; bu.textContent = '更新中…';
-    const r = await jpost('/api/update', {});
-    bu.disabled = false; bu.textContent = '检查更新';
-    if (!r) { alert('连不上本地服务 8787'); return; }
-    if (!r.ok) { alert('更新失败：' + (r.err || '未知错误')); return; }
-    if (!r.n) { alert('已经是最新版，没有文件变化。'); return; }
-    alert('更新了 ' + r.n + ' 个文件：\n' + r.changed.slice(0, 12).join('\n') + (r.changed.length > 12 ? '\n…' : '') + '\n\n备份在 .bak-update/，重启 serve.cmd 生效。');
-  };
+  if (bu) bu.onclick = () => runUpdate(false);
+  const bf = document.getElementById('btnForceUpdate');
+  if (bf) bf.onclick = () => runUpdate(true);
   const br = document.getElementById('btnUsageReset');
   if (br) br.onclick = async () => {
     if (!confirm('用量清零？之后重新累计。')) return;
@@ -154,6 +192,25 @@ function render(st){
   if ($('#chkRunner')) {
     $('#chkRunner').textContent = st.runner ? ('在跑 pid ' + (st.runnerPid || '?')) : '没在跑';
     $('#chkRunner').className = st.runner ? 'ok' : 'dim';
+  }
+  // 版本 + 「磁盘已更新但进程还是旧代码」——这是更新完看不出效果的头号原因
+  if ($('#chkVer')) {
+    const nm = st.buildName || '?';
+    const bd = st.build || 0;
+    const db = st.diskBuild || bd;
+    if (st.stale) {
+      $('#chkVer').textContent = '磁盘 ' + db + ' / 进程 ' + bd + '（要重启）';
+      $('#chkVer').className = 'warn';
+      // 只在"刚发现"时提示一次：render 每 2 秒跑一次，别把更新结果刷掉
+      if (!window.__staleTipShown) {
+        window.__staleTipShown = true;
+        showTip('代码已经更新到 build ' + db + '，但当前这个进程还跑着 build ' + bd + '。\n关掉 serve 窗口，重开 serve.cmd 才生效。', 'warn');
+      }
+    } else {
+      window.__staleTipShown = false;
+      $('#chkVer').textContent = nm + '（build ' + db + '）';
+      $('#chkVer').className = 'ok';
+    }
   }
   $('#chkCdp').textContent = st.cdp ? '正常' : '未连上';
   $('#chkCdp').className = st.cdp ? 'ok' : 'err';
